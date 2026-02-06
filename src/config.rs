@@ -33,9 +33,9 @@ pub struct Config {
     /// Run only pen (no touch).
     #[serde(default)]
     pub pen_only: bool,
-    /// If false, pause the tablet UI (xochitl) via kill -STOP so it doesn't see input; resume on exit with kill -CONT. Default true = no pause (UI sees input).
-    #[serde(default = "default_no_grab")]
-    pub no_grab: bool,
+    /// If true, stop the xochitl service (tablet UI) while streaming so it doesn't interfere with input. Default false (UI runs normally).
+    #[serde(default)]
+    pub stop_ui: bool,
     /// Disable palm rejection.
     #[serde(default)]
     pub no_palm_rejection: bool,
@@ -48,7 +48,7 @@ fn default_host() -> String { "10.11.99.1".into() }
 fn default_pen_device() -> String { "/dev/input/event1".into() }
 fn default_touch_device() -> String { "/dev/input/event2".into() }
 fn default_palm_grace_ms() -> u64 { 500 }
-fn default_no_grab() -> bool { true }
+
 
 impl Default for Config {
     fn default() -> Self {
@@ -60,7 +60,7 @@ impl Default for Config {
             touch_device: default_touch_device(),
             touch_only: false,
             pen_only: false,
-            no_grab: default_no_grab(),
+            stop_ui: false,
             no_palm_rejection: false,
             palm_grace_ms: default_palm_grace_ms(),
         }

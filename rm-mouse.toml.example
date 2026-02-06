@@ -17,6 +17,6 @@ host = "10.11.99.1"
 # --- Behaviour (same as CLI flags) ---
 # touch_only = false
 # pen_only = false
-# no_grab = true   # default: UI sees input. Set false or --use-grab to pause xochitl (kill -STOP/-CONT) so UI doesn't see input
+# stop_ui = false  # default: UI runs normally. Set true or use --stop-ui to stop xochitl service while streaming
 # no_palm_rejection = false
 # palm_grace_ms = 500

@@ -52,9 +52,9 @@ pub fn run(
     palm: Option<SharedPalmState>,
     pause_refcount: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let use_grab = !config.no_grab;
+    let stop_ui = config.stop_ui;
     let (_sess, mut channel, _pause_guard) =
-        ssh::open_input_stream(&config.pen_device, config, use_grab, pause_refcount)?;
+        ssh::open_input_stream(&config.pen_device, config, stop_ui, pause_refcount)?;
     log::info!("[pen] creating uinput device…");
     let device = create_pen_device()?;
     if let Ok(name) = device.sysname() {

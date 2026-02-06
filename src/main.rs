@@ -37,11 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.iter().any(|a| a == "--pen-only") {
         cfg.pen_only = true;
     }
-    if args.iter().any(|a| a == "--no-grab") {
-        cfg.no_grab = true;
+    if args.iter().any(|a| a == "--stop-ui") {
+        cfg.stop_ui = true;
     }
-    if args.iter().any(|a| a == "--use-grab") {
-        cfg.no_grab = false;
+    if args.iter().any(|a| a == "--no-stop-ui") {
+        cfg.stop_ui = false;
     }
     if args.iter().any(|a| a == "--no-palm-rejection") {
         cfg.no_palm_rejection = true;
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let use_grab = !cfg.no_grab;
+    let stop_ui = cfg.stop_ui;
     let run_pen = !cfg.touch_only;
     let run_touch = !cfg.pen_only;
 
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
     log::info!(
-        "rm-mouse starting (host={}, pen={}, touch={}, palm_rejection={}, grab={})",
+        "rm-mouse starting (host={}, pen={}, touch={}, palm_rejection={}, stop_ui={})",
         cfg.host,
         if run_pen { cfg.pen_device.as_str() } else { "off" },
         if run_touch { cfg.touch_device.as_str() } else { "off" },
@@ -73,12 +73,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             "off".into()
         },
-        use_grab
+        stop_ui
     );
 
     if !run_pen && !run_touch {
         eprintln!(
-            "Usage: {} [--pen-only] [--touch-only] [--no-grab] [--use-grab] [--no-palm-rejection] [--palm-grace-ms=N]",
+            "Usage: {} [--pen-only] [--touch-only] [--stop-ui] [--no-stop-ui] [--no-palm-rejection] [--palm-grace-ms=N]",
             args.get(0).unwrap_or(&"rm-mouse".into())
         );
         eprintln!("  Config file: RMMOUSE_CONFIG, ./rm-mouse.toml, or ~/.config/rm-mouse/config.toml");
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let config = Arc::new(cfg);
-    let pause_refcount = if use_grab && (run_pen || run_touch) {
+    let pause_refcount = if stop_ui && (run_pen || run_touch) {
         Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
     } else {
         None
