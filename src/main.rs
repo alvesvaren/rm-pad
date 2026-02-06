@@ -8,6 +8,7 @@ mod touch;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -31,6 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let touch_only = args.iter().any(|a| a == "--touch-only");
     let pen_only = args.iter().any(|a| a == "--pen-only");
+    let no_grab = args.iter().any(|a| a == "--no-grab");
+    let use_grab = !no_grab;
     let no_palm_rejection = args.iter().any(|a| a == "--no-palm-rejection");
     let palm_grace_ms: u64 = args
         .iter()
@@ -50,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!(
-        "rm-mouse starting (host={}, pen={}, touch={}, palm_rejection={})",
+        "rm-mouse starting (host={}, pen={}, touch={}, palm_rejection={}, grab={})",
         config::HOST,
         if run_pen { config::PEN_DEVICE } else { "off" },
         if run_touch { config::TOUCH_DEVICE } else { "off" },
@@ -58,27 +61,51 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             format!("on (grace {}ms)", palm_grace_ms)
         } else {
             "off".into()
-        }
+        },
+        use_grab
     );
 
     let key_path = Path::new(config::KEY_PATH);
 
     if !run_pen && !run_touch {
         eprintln!(
-            "Usage: {} [--pen-only] [--touch-only] [--no-palm-rejection] [--palm-grace-ms=N]",
+            "Usage: {} [--pen-only] [--touch-only] [--no-grab] [--no-palm-rejection] [--palm-grace-ms=N]",
             args.get(0).unwrap_or(&"rm-mouse".into())
         );
-        eprintln!("  Default: run both pen and touch; palm rejection on with 500ms grace.");
+        eprintln!("  Default: run both pen and touch; grab UI on tablet; palm rejection on with 500ms grace.");
         std::process::exit(1);
     }
+
+    let keepalive_stop = Arc::new(AtomicBool::new(false));
+    let keepalive_handle = if use_grab && (run_pen || run_touch) {
+        let key_keep = key_path.to_path_buf();
+        let stop = keepalive_stop.clone();
+        Some(thread::spawn(move || {
+            let cmd = format!("touch {}", config::ALIVE_FILE);
+            while !stop.load(Ordering::Relaxed) {
+                if let Err(e) = ssh::run_command(&key_keep, &cmd) {
+                    log::debug!("[keepalive] touch failed: {}", e);
+                }
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let pen_handle = if run_pen {
         let key_pen = key_path.to_path_buf();
         let palm_pen = palm_state.clone();
+        let grab = use_grab;
         Some(thread::spawn(move || {
             loop {
                 log::info!("[pen] thread starting…");
-                if let Err(e) = pen::run(&key_pen, palm_pen.clone()) {
+                if let Err(e) = pen::run(&key_pen, palm_pen.clone(), grab) {
                     log::error!("[pen] {}", e);
                 }
                 log::warn!("[pen] disconnected, reconnecting in 2s…");
@@ -93,10 +120,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let key_touch = key_path.to_path_buf();
         let palm_touch = palm_state.clone();
         let grace = palm_grace_ms;
+        let grab = use_grab;
         Some(thread::spawn(move || {
             loop {
                 log::info!("[touch] thread starting…");
-                if let Err(e) = touch::run(&key_touch, palm_touch.clone(), grace) {
+                if let Err(e) = touch::run(&key_touch, palm_touch.clone(), grace, grab) {
                     log::error!("[touch] {}", e);
                 }
                 log::warn!("[touch] disconnected, reconnecting in 2s…");
@@ -112,6 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if let Some(h) = touch_handle {
         h.join().unwrap();
+    }
+
+    keepalive_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = keepalive_handle {
+        let _ = h.join();
     }
 
     Ok(())

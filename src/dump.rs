@@ -40,7 +40,8 @@ fn code_name(ty: u16, code: u16) -> String {
 }
 
 pub fn run_dump_touch(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) = ssh::open_input_stream(TOUCH_DEVICE, key_path)?;
+    let (_sess, mut channel) =
+        ssh::open_input_stream(TOUCH_DEVICE, key_path, false, None)?;
     eprintln!("Dumping touch events from {} (Ctrl+C to stop):\n", TOUCH_DEVICE);
     let mut buf = [0u8; INPUT_EVENT_SIZE];
     let mut n = 0u64;
@@ -58,7 +59,7 @@ pub fn run_dump_touch(key_path: &Path) -> Result<(), Box<dyn std::error::Error +
 }
 
 pub fn run_dump_pen(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) = ssh::open_input_stream(PEN_DEVICE, key_path)?;
+    let (_sess, mut channel) = ssh::open_input_stream(PEN_DEVICE, key_path, false, None)?;
     eprintln!("Dumping pen events from {} (Ctrl+C to stop):\n", PEN_DEVICE);
     let mut buf = [0u8; INPUT_EVENT_SIZE];
     let mut n = 0u64;

@@ -10,7 +10,7 @@ use evdevil::event::{Abs, Key, KeyEvent, KeyState};
 use evdevil::uinput::{AbsSetup, UinputDevice};
 use evdevil::{AbsInfo, InputProp, Slot};
 
-use crate::config::TOUCH_DEVICE;
+use crate::config::{TOUCH_DEVICE, TOUCH_PIDFILE};
 use crate::event::{
     parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
     EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
@@ -73,8 +73,10 @@ pub fn run(
     key_path: &Path,
     palm: Option<SharedPalmState>,
     grace_ms: u64,
+    use_grab: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) = ssh::open_input_stream(TOUCH_DEVICE, key_path)?;
+    let (_sess, mut channel) =
+        ssh::open_input_stream(TOUCH_DEVICE, key_path, use_grab, Some(TOUCH_PIDFILE))?;
     run_mt(&mut channel, palm, grace_ms)
 }
 

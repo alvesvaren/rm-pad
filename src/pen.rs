@@ -11,7 +11,7 @@ use evdevil::Bus;
 use evdevil::InputId;
 use evdevil::InputProp;
 
-use crate::config::PEN_DEVICE;
+use crate::config::{PEN_DEVICE, PEN_PIDFILE};
 use crate::event::{
     key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
 };
@@ -48,8 +48,10 @@ fn create_pen_device() -> Result<UinputDevice, Box<dyn std::error::Error + Send 
 pub fn run(
     key_path: &Path,
     palm: Option<SharedPalmState>,
+    use_grab: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) = ssh::open_input_stream(PEN_DEVICE, key_path)?;
+    let (_sess, mut channel) =
+        ssh::open_input_stream(PEN_DEVICE, key_path, use_grab, Some(PEN_PIDFILE))?;
     log::info!("[pen] creating uinput device…");
     let device = create_pen_device()?;
     if let Ok(name) = device.sysname() {
