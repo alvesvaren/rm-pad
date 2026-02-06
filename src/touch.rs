@@ -90,6 +90,9 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
     let mut count: u64 = 0;
     let mut slot_x: [Option<i32>; MT_SLOTS] = [None; MT_SLOTS];
     let mut slot_y: [Option<i32>; MT_SLOTS] = [None; MT_SLOTS];
+    // Last position emitted per slot so we can resend when device doesn't repeat position this frame (multi-finger).
+    let mut slot_last_x: [Option<i32>; MT_SLOTS] = [None; MT_SLOTS];
+    let mut slot_last_y: [Option<i32>; MT_SLOTS] = [None; MT_SLOTS];
     let mut frame_slot_active = [false; MT_SLOTS];
     #[allow(unused_assignments)]
     let mut slot_active = frame_slot_active;
@@ -97,6 +100,8 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
     let mut next_tracking_id: i32 = 0;
     let mut frame_contact_count = 0i32;
     let mut frame_current_slot: usize = 0;
+    // Positions received this frame in order (handles devices that send all slots then all X,Y pairs).
+    let mut pending_positions: Vec<(i32, i32)> = Vec::with_capacity(MT_SLOTS);
 
     log::info!("[touch] waiting for events (touch the reMarkable screen)…");
 
@@ -128,16 +133,45 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                         frame_slot_active[frame_current_slot] = false;
                         slot_x[frame_current_slot] = None;
                         slot_y[frame_current_slot] = None;
+                        slot_last_x[frame_current_slot] = None;
+                        slot_last_y[frame_current_slot] = None;
                     }
                 } else if code == ABS_MT_POSITION_X {
                     slot_x[frame_current_slot] = Some(value);
+                    // Some devices send position without TRACKING_ID for a new finger; treat as active.
+                    if !frame_slot_active[frame_current_slot] {
+                        frame_slot_active[frame_current_slot] = true;
+                        frame_contact_count += 1;
+                    }
                 } else if code == ABS_MT_POSITION_Y {
                     slot_y[frame_current_slot] = Some(value);
+                    if !frame_slot_active[frame_current_slot] {
+                        frame_slot_active[frame_current_slot] = true;
+                        frame_contact_count += 1;
+                    }
+                    // Collect (x,y) in order for reassignment if device sent all IDs then all positions.
+                    if let Some(x) = slot_x[frame_current_slot] {
+                        pending_positions.push((x, value));
+                    }
                 }
             }
             if ty == EV_SYN && code == SYN_REPORT {
                 let contact_count = frame_contact_count;
                 slot_active = frame_slot_active;
+                // If device sent positions in slot order without SLOT before each pair, assign by order.
+                let active_slots: Vec<usize> = (0..MT_SLOTS).filter(|&s| slot_active[s]).collect();
+                if contact_count > 0
+                    && active_slots.len() == contact_count as usize
+                    && pending_positions.len() == contact_count as usize
+                {
+                    for (i, &s) in active_slots.iter().enumerate() {
+                        if let Some(&(ax, ay)) = pending_positions.get(i) {
+                            slot_x[s] = Some(ax);
+                            slot_y[s] = Some(ay);
+                        }
+                    }
+                }
+                pending_positions.clear();
                 let mut w = device.writer();
                 let finger_down = contact_count > 0;
                 for s in 0..MT_SLOTS {
@@ -149,32 +183,35 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                             next_tracking_id = next_tracking_id.wrapping_add(1);
                             slot_tracking_id[s] = Some(next_tracking_id);
                         }
-                        if let (Some(ax), Some(ay)) = (x, y) {
-                            let out_x = ay.clamp(0, TOUCH_Y_MAX);
-                            let out_y = ax.clamp(0, TOUCH_X_MAX);
-                            let slot_w = w.slot(Slot::from(s as u16))?;
-                            if is_new {
-                                let id = slot_tracking_id[s].unwrap();
-                                w = slot_w
-                                    .write(&[
-                                        evdevil::event::AbsEvent::new(Abs::MT_TRACKING_ID, id)
-                                            .into(),
-                                        evdevil::event::AbsEvent::new(Abs::MT_POSITION_X, out_x)
-                                            .into(),
-                                        evdevil::event::AbsEvent::new(Abs::MT_POSITION_Y, out_y)
-                                            .into(),
-                                    ])?
-                                    .finish_slot()?;
-                            } else {
-                                w = slot_w
-                                    .write(&[
-                                        evdevil::event::AbsEvent::new(Abs::MT_POSITION_X, out_x)
-                                            .into(),
-                                        evdevil::event::AbsEvent::new(Abs::MT_POSITION_Y, out_y)
-                                            .into(),
-                                    ])?
-                                    .finish_slot()?;
-                            }
+                        // Use current frame position or last-known so every active finger is emitted every frame (required for gestures).
+                        let (ax, ay) = match (x, y) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => match (slot_last_x[s], slot_last_y[s]) {
+                                (Some(a), Some(b)) => (a, b),
+                                _ => continue, // no position yet for this slot, skip
+                            },
+                        };
+                        let out_x = ay.clamp(0, TOUCH_Y_MAX);
+                        let out_y = ax.clamp(0, TOUCH_X_MAX);
+                        slot_last_x[s] = Some(ax);
+                        slot_last_y[s] = Some(ay);
+                        let slot_w = w.slot(Slot::from(s as u16))?;
+                        if is_new {
+                            let id = slot_tracking_id[s].unwrap();
+                            w = slot_w
+                                .write(&[
+                                    evdevil::event::AbsEvent::new(Abs::MT_TRACKING_ID, id).into(),
+                                    evdevil::event::AbsEvent::new(Abs::MT_POSITION_X, out_x).into(),
+                                    evdevil::event::AbsEvent::new(Abs::MT_POSITION_Y, out_y).into(),
+                                ])?
+                                .finish_slot()?;
+                        } else {
+                            w = slot_w
+                                .write(&[
+                                    evdevil::event::AbsEvent::new(Abs::MT_POSITION_X, out_x).into(),
+                                    evdevil::event::AbsEvent::new(Abs::MT_POSITION_Y, out_y).into(),
+                                ])?
+                                .finish_slot()?;
                         }
                     } else if slot_tracking_id[s].is_some() {
                         let slot_w = w.slot(Slot::from(s as u16))?;
@@ -195,19 +232,16 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                     ])?;
                 }
                 // Emit after slot/ABS so libinput sees positions then touch state.
-                // BTN_TOOL_FINGER = sanity check; BTN_TOUCH = pointer motion/click.
-                // BTN_TOOL_DOUBLETAP/TRIPLETAP/QUADTAP = finger count for gesture detection (scroll, pinch, etc.).
-                let k = contact_count as u32;
-                w = w.write(&[
-                    KeyEvent::new(
-                        Key::BTN_TOOL_FINGER,
-                        if finger_down {
-                            KeyState::PRESSED
-                        } else {
-                            KeyState::RELEASED
-                        },
-                    )
-                    .into(),
+                // BTN_TOOL_*: only one may be PRESSED at a time (libinput "Invalid fake finger state" else).
+                // 1 finger = FINGER, 2 = DOUBLETAP, 3 = TRIPLETAP, 4+ = QUADTAP. BTN_TOUCH = any finger down.
+                let tool_key = match contact_count {
+                    0 => None,
+                    1 => Some(Key::BTN_TOOL_FINGER),
+                    2 => Some(Key::BTN_TOOL_DOUBLETAP),
+                    3 => Some(Key::BTN_TOOL_TRIPLETAP),
+                    _ => Some(Key::BTN_TOOL_QUADTAP),
+                };
+                let mut key_events: Vec<evdevil::event::InputEvent> = vec![
                     KeyEvent::new(
                         Key::BTN_TOUCH,
                         if finger_down {
@@ -217,34 +251,18 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                         },
                     )
                     .into(),
-                    KeyEvent::new(
-                        Key::BTN_TOOL_DOUBLETAP,
-                        if k >= 2 {
-                            KeyState::PRESSED
-                        } else {
-                            KeyState::RELEASED
-                        },
-                    )
-                    .into(),
-                    KeyEvent::new(
-                        Key::BTN_TOOL_TRIPLETAP,
-                        if k >= 3 {
-                            KeyState::PRESSED
-                        } else {
-                            KeyState::RELEASED
-                        },
-                    )
-                    .into(),
-                    KeyEvent::new(
-                        Key::BTN_TOOL_QUADTAP,
-                        if k >= 4 {
-                            KeyState::PRESSED
-                        } else {
-                            KeyState::RELEASED
-                        },
-                    )
-                    .into(),
-                ])?;
+                ];
+                for key in [
+                    Key::BTN_TOOL_FINGER,
+                    Key::BTN_TOOL_DOUBLETAP,
+                    Key::BTN_TOOL_TRIPLETAP,
+                    Key::BTN_TOOL_QUADTAP,
+                ] {
+                    key_events.push(
+                        KeyEvent::new(key, if Some(key) == tool_key { KeyState::PRESSED } else { KeyState::RELEASED }).into(),
+                    );
+                }
+                w = w.write(&key_events)?;
                 w.finish()?;
                 if count == 0 {
                     log::info!("[touch] first event batch (events are flowing)");
