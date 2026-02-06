@@ -3,14 +3,15 @@
 //! Cursor moves with finger like a laptop touchpad (libinput turns absolute positions into pointer motion).
 
 use std::io::Read;
-use std::path::Path;
 use std::time::Duration;
 
 use evdevil::event::{Abs, Key, KeyEvent, KeyState};
 use evdevil::uinput::{AbsSetup, UinputDevice};
 use evdevil::{AbsInfo, InputProp, Slot};
 
-use crate::config::{TOUCH_DEVICE, TOUCH_PIDFILE};
+use std::sync::Arc;
+
+use crate::config::Config;
 use crate::event::{
     parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
     EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
@@ -70,13 +71,14 @@ fn create_touchpad_device() -> Result<UinputDevice, Box<dyn std::error::Error + 
 }
 
 pub fn run(
-    key_path: &Path,
+    config: &Config,
     palm: Option<SharedPalmState>,
     grace_ms: u64,
-    use_grab: bool,
+    pause_refcount: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) =
-        ssh::open_input_stream(TOUCH_DEVICE, key_path, use_grab, Some(TOUCH_PIDFILE))?;
+    let use_grab = !config.no_grab;
+    let (_sess, mut channel, _pause_guard) =
+        ssh::open_input_stream(&config.touch_device, config, use_grab, pause_refcount)?;
     run_mt(&mut channel, palm, grace_ms)
 }
 
@@ -117,7 +119,9 @@ fn run_mt(
     log::info!("[touch] waiting for events (touch the reMarkable screen)…");
 
     loop {
-        channel.read_exact(&mut buf)?;
+        if let Err(e) = channel.read_exact(&mut buf) {
+            return Err(e.into());
+        }
         if let Some(ev) = parse_input_event(&buf) {
             let ty = ev.event_type().raw();
             let code = ev.raw_code();

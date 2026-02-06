@@ -3,3 +3,4 @@
 rm-key*
 dumps/
 grabber/rm-mouse-grabber
+rm-mouse.toml

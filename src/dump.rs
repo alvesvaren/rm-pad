@@ -2,9 +2,8 @@
 //! Run: rm-mouse dump touch  (or dump pen) to stream and print events.
 
 use std::io::Read;
-use std::path::Path;
 
-use crate::config::{PEN_DEVICE, TOUCH_DEVICE};
+use crate::config::Config;
 use crate::event::{parse_input_event, INPUT_EVENT_SIZE};
 use crate::ssh;
 
@@ -39,10 +38,10 @@ fn code_name(ty: u16, code: u16) -> String {
     format!("type{} code{}", ty, code)
 }
 
-pub fn run_dump_touch(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) =
-        ssh::open_input_stream(TOUCH_DEVICE, key_path, false, None)?;
-    eprintln!("Dumping touch events from {} (Ctrl+C to stop):\n", TOUCH_DEVICE);
+pub fn run_dump_touch(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_sess, mut channel, _guard) =
+        ssh::open_input_stream(&config.touch_device, config, false, None)?;
+    eprintln!("Dumping touch events from {} (Ctrl+C to stop):\n", config.touch_device);
     let mut buf = [0u8; INPUT_EVENT_SIZE];
     let mut n = 0u64;
     loop {
@@ -58,9 +57,9 @@ pub fn run_dump_touch(key_path: &Path) -> Result<(), Box<dyn std::error::Error +
     }
 }
 
-pub fn run_dump_pen(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_sess, mut channel) = ssh::open_input_stream(PEN_DEVICE, key_path, false, None)?;
-    eprintln!("Dumping pen events from {} (Ctrl+C to stop):\n", PEN_DEVICE);
+pub fn run_dump_pen(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_sess, mut channel, _guard) = ssh::open_input_stream(&config.pen_device, config, false, None)?;
+    eprintln!("Dumping pen events from {} (Ctrl+C to stop):\n", config.pen_device);
     let mut buf = [0u8; INPUT_EVENT_SIZE];
     let mut n = 0u64;
     loop {

@@ -1,0 +1,22 @@
+# rm-mouse config (TOML). Copy to rm-mouse.toml or ~/.config/rm-mouse/config.toml
+# Config file search order: RMMOUSE_CONFIG env, ./rm-mouse.toml, ~/.config/rm-mouse/config.toml
+
+# --- Connection ---
+host = "10.11.99.1"
+# SSH key path (used only if password is not set). Default: "rm-key"
+# key_path = "rm-key"
+
+# Login with password instead of key (user is always root).
+# If set, key_path is ignored. Restrict file permissions: chmod 600 config.toml
+# password = "your-root-password"
+
+# --- Device paths on reMarkable ---
+# pen_device = "/dev/input/event1"
+# touch_device = "/dev/input/event2"
+
+# --- Behaviour (same as CLI flags) ---
+# touch_only = false
+# pen_only = false
+# no_grab = true   # default: UI sees input. Set false or --use-grab to pause xochitl (kill -STOP/-CONT) so UI doesn't see input
+# no_palm_rejection = false
+# palm_grace_ms = 500
