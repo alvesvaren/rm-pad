@@ -1,6 +1,6 @@
 //! Configuration for SSH and device paths.
 
-pub const HOST: &str = "172.20.10.3";
+pub const HOST: &str = "192.168.1.69";
 pub const USER: &str = "root";
 pub const KEY_PATH: &str = "rm-key";
 

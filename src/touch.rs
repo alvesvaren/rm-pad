@@ -1,20 +1,19 @@
-//! Forward reMarkable touch as either:
-//! - MT touchpad (default): absolute multi-touch for libinput gestures/tap; can fail sanity checks on some setups.
-//! - Relative (--relative-touch): REL_X/REL_Y only, one finger = cursor; always works, no gestures.
+//! Forward reMarkable touch as a libinput MT touchpad (absolute multi-touch).
 //! Axes swapped: device X -> output Y, device Y -> output X.
+//! Cursor moves with finger like a laptop touchpad (libinput turns absolute positions into pointer motion).
 
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use evdevil::event::{Abs, InputEvent, Key, Rel};
+use evdevil::event::{Abs, Key, KeyEvent, KeyState};
 use evdevil::uinput::{AbsSetup, UinputDevice};
 use evdevil::{AbsInfo, InputProp, Slot};
 
 use crate::config::TOUCH_DEVICE;
 use crate::event::{
-    key_event, parse_input_event, rel_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT,
-    ABS_MT_TRACKING_ID, EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, REL_X, REL_Y, SYN_REPORT,
+    parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
+    EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
 };
 use crate::ssh;
 
@@ -25,177 +24,50 @@ const TOUCH_X_MAX: i32 = 1872;
 const TOUCH_Y_MAX: i32 = 1404;
 const TOUCH_RESOLUTION: i32 = 9; // units/mm (libinput uses for size: range/resolution = mm)
 
-/// Relative (mouse-like) device: libinput accepts as mouse, no touchpad sanity checks.
-fn create_relative_device() -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
-    UinputDevice::builder()?
-        .with_props([InputProp::POINTER])?
-        .with_rel_axes([Rel::X, Rel::Y])?
-        .with_keys([Key::BTN_LEFT, Key::BTN_TOUCH])?
-        .build("reMarkable Touch Rel")
-        .map_err(Into::into)
-}
-
 fn create_touchpad_device() -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
-    // libinput touchpad sanity checks require ABS_X, ABS_Y (legacy) plus ABS_MT_*.
+    // libinput touchpad sanity checks require:
+    // - ABS_X, ABS_Y (legacy) and ABS_MT_POSITION_X/Y with matching ranges and resolution (both axes).
+    // - Axis ranges must match the values we emit. We swap device X/Y when writing (device X→output Y,
+    //   device Y→output X), so output X range is 0..TOUCH_Y_MAX and output Y range is 0..TOUCH_X_MAX.
+    // - INPUT_PROP_BUTTONPAD: clickpad (no separate physical buttons).
+    // - BTN_TOOL_FINGER: required by libinput tp_pass_sanity_check() so the device is accepted.
+    let out_x_max = TOUCH_Y_MAX; // logical X = device Y
+    let out_y_max = TOUCH_X_MAX; // logical Y = device X
     let axes: [AbsSetup; 6] = [
         AbsSetup::new(
             Abs::X,
-            AbsInfo::new(0, TOUCH_X_MAX).with_resolution(TOUCH_RESOLUTION),
+            AbsInfo::new(0, out_x_max).with_resolution(TOUCH_RESOLUTION),
         ),
         AbsSetup::new(
             Abs::Y,
-            AbsInfo::new(0, TOUCH_Y_MAX).with_resolution(TOUCH_RESOLUTION),
+            AbsInfo::new(0, out_y_max).with_resolution(TOUCH_RESOLUTION),
         ),
         AbsSetup::new(Abs::MT_SLOT, AbsInfo::new(0, (MT_SLOTS - 1) as i32)),
         AbsSetup::new(Abs::MT_TRACKING_ID, AbsInfo::new(-1, i32::MAX)),
         AbsSetup::new(
             Abs::MT_POSITION_X,
-            AbsInfo::new(0, TOUCH_X_MAX).with_resolution(TOUCH_RESOLUTION),
+            AbsInfo::new(0, out_x_max).with_resolution(TOUCH_RESOLUTION),
         ),
         AbsSetup::new(
             Abs::MT_POSITION_Y,
-            AbsInfo::new(0, TOUCH_Y_MAX).with_resolution(TOUCH_RESOLUTION),
+            AbsInfo::new(0, out_y_max).with_resolution(TOUCH_RESOLUTION),
         ),
     ];
     let device = UinputDevice::builder()?
-        .with_props([InputProp::POINTER])?
+        .with_props([InputProp::POINTER, InputProp::BUTTONPAD])?
         .with_abs_axes(axes)?
-        .with_keys([evdevil::event::Key::BTN_LEFT, evdevil::event::Key::BTN_TOUCH])?
+        .with_keys([
+            evdevil::event::Key::BTN_LEFT,
+            evdevil::event::Key::BTN_TOUCH,
+            evdevil::event::Key::BTN_TOOL_FINGER,
+        ])?
         .build("reMarkable Touch")?;
     Ok(device)
 }
 
-pub fn run(key_path: &Path, relative: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_sess, mut channel) = ssh::open_input_stream(TOUCH_DEVICE, key_path)?;
-
-    if relative {
-        run_relative(&mut channel, key_path)
-    } else {
-        run_mt(&mut channel)
-    }
-}
-
-fn run_relative(
-    channel: &mut impl Read,
-    _key_path: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("[touch] creating uinput relative device (reMarkable Touch Rel)…");
-    let device = create_relative_device()?;
-    if let Ok(name) = device.sysname() {
-        log::info!(
-            "[touch] uinput device created: /sys/devices/virtual/input/{}",
-            name.to_string_lossy()
-        );
-    }
-    std::thread::sleep(Duration::from_secs(1));
-    log::info!("[touch] relative mode: one finger = cursor (axes swapped). Use without --relative-touch for MT gestures if supported.");
-
-    let btn_touch_code = Key::BTN_TOUCH.raw();
-    let mut buf = [0u8; INPUT_EVENT_SIZE];
-    let mut touch_down = false;
-    let mut count: u64 = 0;
-    let mut slot_x: [Option<i32>; 16] = [None; 16];
-    let mut slot_y: [Option<i32>; 16] = [None; 16];
-    let mut frame_slot_active = [false; 16];
-    #[allow(unused_assignments)]
-    let mut slot_active = frame_slot_active;
-    let mut primary_slot: Option<usize> = None;
-    let mut last_primary_x: Option<i32> = None;
-    let mut last_primary_y: Option<i32> = None;
-    let mut frame_contact_count = 0i32;
-    let mut frame_current_slot: usize = 0;
-
-    log::info!("[touch] waiting for events (touch the reMarkable screen)…");
-
-    loop {
-        channel.read_exact(&mut buf)?;
-        if let Some(ev) = parse_input_event(&buf) {
-            let ty = ev.event_type().raw();
-            let code = ev.raw_code();
-            let value = ev.raw_value();
-            if ty == EV_KEY {
-                continue;
-            }
-            if ty == EV_ABS {
-                if code == ABS_MT_SLOT {
-                    frame_current_slot = value.max(0) as usize;
-                    if frame_current_slot >= 16 {
-                        frame_current_slot = 15;
-                    }
-                } else if code == ABS_MT_TRACKING_ID {
-                    if value >= 0 {
-                        if !frame_slot_active[frame_current_slot] {
-                            frame_contact_count += 1;
-                        }
-                        frame_slot_active[frame_current_slot] = true;
-                    } else {
-                        if frame_slot_active[frame_current_slot] {
-                            frame_contact_count = frame_contact_count.saturating_sub(1);
-                        }
-                        frame_slot_active[frame_current_slot] = false;
-                        slot_x[frame_current_slot] = None;
-                        slot_y[frame_current_slot] = None;
-                    }
-                } else if code == ABS_MT_POSITION_X {
-                    slot_x[frame_current_slot] = Some(value);
-                } else if code == ABS_MT_POSITION_Y {
-                    slot_y[frame_current_slot] = Some(value);
-                }
-            }
-            if ty == EV_SYN && code == SYN_REPORT {
-                let contact_count = frame_contact_count;
-                slot_active = frame_slot_active;
-                let first_active_slot = || (0..16).find(|&i| slot_active[i]);
-                let new_primary = if contact_count == 0 {
-                    None
-                } else if primary_slot.map_or(false, |s| s < 16 && slot_active[s]) {
-                    primary_slot
-                } else {
-                    first_active_slot()
-                };
-                if new_primary != primary_slot {
-                    primary_slot = new_primary;
-                    if let Some(s) = primary_slot {
-                        last_primary_x = slot_x[s];
-                        last_primary_y = slot_y[s];
-                    } else {
-                        last_primary_x = None;
-                        last_primary_y = None;
-                    }
-                }
-                let mut out: Vec<InputEvent> = Vec::with_capacity(16);
-                if contact_count > 0 && !touch_down {
-                    out.push(key_event(btn_touch_code, 1));
-                    touch_down = true;
-                } else if contact_count == 0 && touch_down {
-                    out.push(key_event(btn_touch_code, 0));
-                    touch_down = false;
-                }
-                if contact_count == 1 {
-                    if let Some(s) = primary_slot {
-                        if let (Some(x), Some(y)) = (slot_x[s], slot_y[s]) {
-                            if let (Some(px), Some(py)) = (last_primary_x, last_primary_y) {
-                                out.push(rel_event(REL_X, y - py));
-                                out.push(rel_event(REL_Y, x - px));
-                            }
-                            last_primary_x = Some(x);
-                            last_primary_y = Some(y);
-                        }
-                    }
-                }
-                if !out.is_empty() {
-                    out.push(evdevil::event::SynEvent::new(evdevil::event::Syn::REPORT).into());
-                    device.write(&out)?;
-                    if count == 0 {
-                        log::info!("[touch] first event batch (events are flowing)");
-                    }
-                }
-                frame_slot_active = slot_active;
-                count += 1;
-                log::debug!("[touch] frame #{} contacts={}", count, contact_count);
-            }
-        }
-    }
+    run_mt(&mut channel)
 }
 
 fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -209,7 +81,7 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
     }
     log::info!("[touch] waiting 1s for udev/libinput to attach…");
     std::thread::sleep(Duration::from_secs(1));
-    log::info!("[touch] absolute MT touchpad (pointer + gestures, axes swapped). If you see 'device failed touchpad sanity checks', run with --relative-touch for a working cursor.");
+    log::info!("[touch] absolute MT touchpad (pointer + gestures, axes swapped).");
 
     let mut buf = [0u8; INPUT_EVENT_SIZE];
     let mut count: u64 = 0;
@@ -264,6 +136,7 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                 let contact_count = frame_contact_count;
                 slot_active = frame_slot_active;
                 let mut w = device.writer();
+                let finger_down = contact_count > 0;
                 for s in 0..MT_SLOTS {
                     let active = slot_active[s];
                     let (x, y) = (slot_x[s], slot_y[s]);
@@ -318,6 +191,27 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                         evdevil::event::AbsEvent::new(Abs::Y, out_x).into(),
                     ])?;
                 }
+                // Emit after slot/ABS so libinput sees positions then touch state. BTN_TOOL_FINGER = sanity check; BTN_TOUCH = pointer motion/click.
+                w = w.write(&[
+                    KeyEvent::new(
+                        Key::BTN_TOOL_FINGER,
+                        if finger_down {
+                            KeyState::PRESSED
+                        } else {
+                            KeyState::RELEASED
+                        },
+                    )
+                    .into(),
+                    KeyEvent::new(
+                        Key::BTN_TOUCH,
+                        if finger_down {
+                            KeyState::PRESSED
+                        } else {
+                            KeyState::RELEASED
+                        },
+                    )
+                    .into(),
+                ])?;
                 w.finish()?;
                 if count == 0 {
                     log::info!("[touch] first event batch (events are flowing)");

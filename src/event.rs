@@ -7,11 +7,8 @@ pub const INPUT_EVENT_SIZE: usize = 16;
 
 pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
-pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 pub const SYN_REPORT: u16 = 0;
-pub const REL_X: u16 = 0x00;
-pub const REL_Y: u16 = 0x01;
 pub const ABS_MT_SLOT: u16 = 0x2f;       // 47
 pub const ABS_MT_POSITION_X: u16 = 0x35; // 53
 pub const ABS_MT_POSITION_Y: u16 = 0x36; // 54
@@ -33,9 +30,4 @@ pub fn parse_input_event(buf: &[u8]) -> Option<InputEvent> {
 /// Build a key event (EV_KEY) for uinput.
 pub fn key_event(code: u16, value: i32) -> InputEvent {
     InputEvent::new(EventType::from_raw(EV_KEY), code, value)
-}
-
-/// Build a relative axis event (EV_REL) for uinput.
-pub fn rel_event(code: u16, value: i32) -> InputEvent {
-    InputEvent::new(EventType::from_raw(EV_REL), code, value)
 }
