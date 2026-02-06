@@ -2,6 +2,7 @@ mod config;
 mod device;
 mod dump;
 mod input;
+mod orientation;
 mod palm;
 mod ssh;
 
@@ -65,12 +66,13 @@ fn log_startup_info(config: &Config) {
     };
 
     log::info!(
-        "Starting rm-mouse: host={}, pen={}, touch={}, palm_rejection={}, stop_ui={}",
+        "Starting rm-mouse: host={}, pen={}, touch={}, palm_rejection={}, stop_ui={}, orientation={}",
         config.host,
         if config.run_pen() { &config.pen_device } else { "off" },
         if config.run_touch() { &config.touch_device } else { "off" },
         palm_info,
-        config.stop_ui
+        config.stop_ui,
+        config.orientation
     );
 }
 

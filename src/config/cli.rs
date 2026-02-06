@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::orientation::Orientation;
+
 #[derive(Parser)]
 #[command(name = "rm-mouse")]
 #[command(about = "Forward reMarkable tablet input to your computer")]
@@ -52,6 +54,10 @@ pub struct Cli {
     /// Palm rejection grace period in milliseconds
     #[arg(long)]
     pub palm_grace_ms: Option<u64>,
+
+    /// Screen orientation (portrait, landscape-right, landscape-left, inverted)
+    #[arg(long, value_parser = clap::value_parser!(Orientation))]
+    pub orientation: Option<Orientation>,
 
     /// Path to config file
     #[arg(long, env = "RMMOUSE_CONFIG")]

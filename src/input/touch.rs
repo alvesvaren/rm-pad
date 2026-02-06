@@ -9,6 +9,7 @@ use evdevil::{AbsInfo, InputProp, Slot};
 
 use crate::config::Config;
 use crate::device::DeviceProfile;
+use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
 use crate::ssh;
 
@@ -61,14 +62,16 @@ impl SlotState {
         }
     }
 
-    fn get_primary_position(&self, device: &DeviceProfile) -> Option<(i32, i32)> {
+    fn get_primary_position(&self, device: &DeviceProfile, orientation: Orientation) -> Option<(i32, i32)> {
         (0..MT_SLOTS)
             .find(|&s| self.active[s])
             .and_then(|s| self.x[s].zip(self.y[s]))
             .map(|(ax, ay)| {
-                (
-                    ay.clamp(0, device.touch_y_max),
+                orientation.transform_touch(
                     ax.clamp(0, device.touch_x_max),
+                    ay.clamp(0, device.touch_y_max),
+                    device.touch_x_max,
+                    device.touch_y_max,
                 )
             })
     }
@@ -90,9 +93,8 @@ impl FrameState {
     }
 }
 
-fn create_touchpad_device(device: &DeviceProfile) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
-    let out_x_max = device.touch_y_max;
-    let out_y_max = device.touch_x_max;
+fn create_touchpad_device(device: &DeviceProfile, orientation: Orientation) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
+    let (out_x_max, out_y_max) = orientation.touch_output_dimensions(device.touch_x_max, device.touch_y_max);
     let resolution = device.touch_resolution;
 
     let axes = [
@@ -130,7 +132,7 @@ pub fn run_touch(
         ssh::open_input_stream(&config.touch_device, config, config.stop_ui, pause_refcount)?;
 
     log::info!("Creating touch uinput device");
-    let uinput = create_touchpad_device(device_profile)?;
+    let uinput = create_touchpad_device(device_profile, config.orientation)?;
 
     if let Ok(name) = uinput.sysname() {
         log::info!("Touch device ready: /sys/devices/virtual/input/{}", name.to_string_lossy());
@@ -139,13 +141,14 @@ pub fn run_touch(
     std::thread::sleep(Duration::from_secs(1));
     log::info!("Touch forwarding started");
 
-    run_event_loop(&mut channel, &uinput, device_profile, palm, config.palm_grace_ms)
+    run_event_loop(&mut channel, &uinput, device_profile, config.orientation, palm, config.palm_grace_ms)
 }
 
 fn run_event_loop(
     channel: &mut impl Read,
     uinput: &UinputDevice,
     device: &DeviceProfile,
+    orientation: Orientation,
     palm: Option<SharedPalmState>,
     grace_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -189,7 +192,7 @@ fn run_event_loop(
             continue;
         }
 
-        emit_touch_frame(uinput, &mut slots, &mut next_tracking_id, device)?;
+        emit_touch_frame(uinput, &mut slots, &mut next_tracking_id, device, orientation)?;
         log_frame_progress(&mut frame_count, contact_count, false);
     }
 }
@@ -306,9 +309,11 @@ fn emit_touch_frame(
     slots: &mut SlotState,
     next_tracking_id: &mut i32,
     device: &DeviceProfile,
+    orientation: Orientation,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = uinput.writer();
     let contact_count = slots.active_count();
+    let (out_x_max, out_y_max) = orientation.touch_output_dimensions(device.touch_x_max, device.touch_y_max);
 
     for slot in 0..MT_SLOTS {
         if slots.active[slot] {
@@ -322,8 +327,14 @@ fn emit_touch_frame(
                 continue;
             };
 
-            let out_x = ay.clamp(0, device.touch_y_max);
-            let out_y = ax.clamp(0, device.touch_x_max);
+            let (out_x, out_y) = orientation.transform_touch(
+                ax.clamp(0, device.touch_x_max),
+                ay.clamp(0, device.touch_y_max),
+                device.touch_x_max,
+                device.touch_y_max,
+            );
+            let out_x = out_x.clamp(0, out_x_max);
+            let out_y = out_y.clamp(0, out_y_max);
             slots.last_x[slot] = Some(ax);
             slots.last_y[slot] = Some(ay);
 
@@ -354,10 +365,10 @@ fn emit_touch_frame(
         }
     }
 
-    if let Some((out_x, out_y)) = slots.get_primary_position(device) {
+    if let Some((out_x, out_y)) = slots.get_primary_position(device, orientation) {
         writer = writer.write(&[
-            evdevil::event::AbsEvent::new(Abs::X, out_y).into(),
-            evdevil::event::AbsEvent::new(Abs::Y, out_x).into(),
+            evdevil::event::AbsEvent::new(Abs::X, out_x).into(),
+            evdevil::event::AbsEvent::new(Abs::Y, out_y).into(),
         ])?;
     }
 

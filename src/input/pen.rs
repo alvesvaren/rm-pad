@@ -9,15 +9,22 @@ use evdevil::{AbsInfo, Bus, InputId, InputProp};
 
 use crate::config::Config;
 use crate::device::DeviceProfile;
+use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
 use crate::ssh;
 
 use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT};
 
-fn create_pen_device(device: &DeviceProfile) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_TILT_X: u16 = 0x1a;
+const ABS_TILT_Y: u16 = 0x1b;
+
+fn create_pen_device(device: &DeviceProfile, orientation: Orientation) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
+    let (out_x_max, out_y_max) = orientation.pen_output_dimensions(device.pen_x_max, device.pen_y_max);
     let axes = [
-        AbsSetup::new(Abs::X, AbsInfo::new(device.pen_x_min, device.pen_x_max).with_resolution(100)),
-        AbsSetup::new(Abs::Y, AbsInfo::new(device.pen_y_min, device.pen_y_max).with_resolution(100)),
+        AbsSetup::new(Abs::X, AbsInfo::new(0, out_x_max).with_resolution(100)),
+        AbsSetup::new(Abs::Y, AbsInfo::new(0, out_y_max).with_resolution(100)),
         AbsSetup::new(Abs::PRESSURE, AbsInfo::new(0, device.pen_pressure_max)),
         AbsSetup::new(Abs::DISTANCE, AbsInfo::new(0, device.pen_distance_max)),
         AbsSetup::new(Abs::TILT_X, AbsInfo::new(-device.pen_tilt_range, device.pen_tilt_range)),
@@ -44,7 +51,7 @@ pub fn run_pen(
         ssh::open_input_stream(&config.pen_device, config, config.stop_ui, pause_refcount)?;
 
     log::info!("Creating pen uinput device");
-    let uinput = create_pen_device(device_profile)?;
+    let uinput = create_pen_device(device_profile, config.orientation)?;
 
     if let Ok(name) = uinput.sysname() {
         log::info!("Pen device ready: /sys/devices/virtual/input/{}", name.to_string_lossy());
@@ -59,6 +66,13 @@ pub fn run_pen(
     let mut touch_down = false;
     let mut frame_count: u64 = 0;
 
+    // For collecting X/Y/tilt values within a frame
+    let mut pending_x: Option<i32> = None;
+    let mut pending_y: Option<i32> = None;
+    let mut pending_tilt_x: Option<i32> = None;
+    let mut pending_tilt_y: Option<i32> = None;
+    let orientation = config.orientation;
+
     loop {
         channel.read_exact(&mut buf)?;
 
@@ -68,10 +82,53 @@ pub fn run_pen(
 
         let ty = ev.event_type().raw();
         let code = ev.raw_code();
+        let value = ev.raw_value();
+
+        // Collect position and tilt values, defer transformation until SYN_REPORT
+        if ty == EV_ABS {
+            match code {
+                ABS_X => {
+                    pending_x = Some(value);
+                    continue;
+                }
+                ABS_Y => {
+                    pending_y = Some(value);
+                    continue;
+                }
+                ABS_TILT_X => {
+                    pending_tilt_x = Some(value);
+                    continue;
+                }
+                ABS_TILT_Y => {
+                    pending_tilt_y = Some(value);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         batch.push(ev);
 
         if ty != EV_SYN || code != SYN_REPORT {
             continue;
+        }
+
+        // Transform and emit position events
+        if let (Some(x), Some(y)) = (pending_x.take(), pending_y.take()) {
+            let (out_x, out_y) = orientation.transform_pen(
+                x, y,
+                device_profile.pen_x_max,
+                device_profile.pen_y_max,
+            );
+            batch.insert(0, InputEvent::new(evdevil::event::EventType::from_raw(EV_ABS), Abs::X.raw(), out_x));
+            batch.insert(1, InputEvent::new(evdevil::event::EventType::from_raw(EV_ABS), Abs::Y.raw(), out_y));
+        }
+
+        // Transform and emit tilt events
+        if let (Some(tx), Some(ty)) = (pending_tilt_x.take(), pending_tilt_y.take()) {
+            let (out_tx, out_ty) = orientation.transform_tilt(tx, ty);
+            batch.insert(0, InputEvent::new(evdevil::event::EventType::from_raw(EV_ABS), Abs::TILT_X.raw(), out_tx));
+            batch.insert(1, InputEvent::new(evdevil::event::EventType::from_raw(EV_ABS), Abs::TILT_Y.raw(), out_ty));
         }
 
         let pressure = batch
