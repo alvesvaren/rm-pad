@@ -11,7 +11,12 @@ use ssh2::Session;
 use crate::config::{Auth, Config};
 
 const USER: &str = "root";
-const XOCHITL_PAUSE_CMD: &str = "p=$(pidof xochitl); [ -n \"$p\" ] && kill -STOP $p";
+/// Shell command template that pauses xochitl, sets up a trap to resume on exit, then cats the device.
+/// When the SSH connection dies for any reason (network timeout, Ctrl+C, laptop crash), the trap fires
+/// and resumes xochitl automatically. {} is the device path.
+const CAT_WITH_TRAP_CMD: &str = "p=$(pidof xochitl); [ -n \"$p\" ] && kill -STOP $p && trap 'kill -CONT $p' EXIT; cat {}";
+/// Plain cat command for when grab is not used.
+const CAT_CMD: &str = "cat {}";
 const XOCHITL_RESUME_CMD: &str = "p=$(pidof xochitl); [ -n \"$p\" ] && kill -CONT $p";
 
 fn authenticate(sess: &mut Session, auth: &Auth) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -26,14 +31,6 @@ fn authenticate(sess: &mut Session, auth: &Auth) -> Result<(), Box<dyn std::erro
     if !sess.authenticated() {
         return Err("SSH auth failed".into());
     }
-    Ok(())
-}
-
-/// Pause the reMarkable UI (xochitl) so it does not see input. No files on device needed.
-pub fn pause_xochitl(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cmd = format!("sh -c '{}'", XOCHITL_PAUSE_CMD);
-    log::info!("Pausing xochitl (kill -STOP)…");
-    run_command(config, &cmd)?;
     Ok(())
 }
 
@@ -67,10 +64,10 @@ impl Drop for XochitlPauseGuard {
     }
 }
 
-/// Connect to the reMarkable and run `cat` on the device. Optionally pause xochitl first so the UI
-/// does not see input (no binary on device: uses kill -STOP / -CONT over SSH).
-/// Returns (session, channel, optional guard). Keep the guard until done reading; when dropped it
-/// resumes xochitl if this was the last stream using pause.
+/// Connect to the reMarkable and run `cat` on the device. If use_grab is true, pauses xochitl
+/// with a shell trap that automatically resumes it when the connection dies for any reason
+/// (network timeout, Ctrl+C, laptop crash, etc.) - no cleanup needed on the host side.
+/// Returns (session, channel, optional guard). The guard provides backup resume on clean local exit.
 pub fn open_input_stream(
     device_path: &str,
     config: &Config,
@@ -86,25 +83,28 @@ pub fn open_input_stream(
     authenticate(&mut sess, &auth)?;
     let mut channel = sess.channel_session()?;
 
+    // Build the command: if grabbing, use trap-based command that auto-resumes on exit
+    let cmd = if use_grab {
+        log::info!("Using grab mode with shell trap (auto-resume on connection loss)");
+        CAT_WITH_TRAP_CMD.replace("{}", device_path)
+    } else {
+        CAT_CMD.replace("{}", device_path)
+    };
+
+    // Create guard as backup for clean local exits (e.g., graceful shutdown)
     let guard = if use_grab {
         let refcount = match &pause_refcount {
             Some(r) => r.clone(),
             None => Arc::new(AtomicUsize::new(0)),
         };
-        let prev = refcount.fetch_add(1, Ordering::SeqCst);
-        if prev == 0 {
-            if let Err(e) = pause_xochitl(config) {
-                refcount.fetch_sub(1, Ordering::SeqCst);
-                return Err(e.into());
-            }
-        }
+        refcount.fetch_add(1, Ordering::SeqCst);
         Some(XochitlPauseGuard::new(config.clone(), refcount))
     } else {
         None
     };
 
-    log::info!("SSH connected, running cat {}…", device_path);
-    channel.exec(&format!("cat {}", device_path))?;
+    log::info!("SSH connected, running: {}", cmd);
+    channel.exec(&cmd)?;
     channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
     log::info!("stream ready for {}", device_path);
     Ok((sess, channel, guard))
