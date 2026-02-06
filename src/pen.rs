@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::time::Instant;
 
 use evdevil::event::{Abs, InputEvent, Key};
 use evdevil::uinput::{AbsSetup, UinputDevice};
@@ -14,6 +15,7 @@ use crate::config::PEN_DEVICE;
 use crate::event::{
     key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
 };
+use crate::palm::SharedPalmState;
 use crate::ssh;
 
 // reMarkable digitizer ranges from pen_bounds dump: X 39..20892, Y 164..15725.
@@ -43,7 +45,10 @@ fn create_pen_device() -> Result<UinputDevice, Box<dyn std::error::Error + Send 
     Ok(device)
 }
 
-pub fn run(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run(
+    key_path: &Path,
+    palm: Option<SharedPalmState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_sess, mut channel) = ssh::open_input_stream(PEN_DEVICE, key_path)?;
     log::info!("[pen] creating uinput device…");
     let device = create_pen_device()?;
@@ -75,6 +80,14 @@ pub fn run(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Syn
                     .map(|e| e.raw_value())
                     .unwrap_or(0);
                 let now_touching = pressure > 0;
+                if let Some(ref palm_state) = palm {
+                    if let Ok(mut state) = palm_state.lock() {
+                        state.pen_down = now_touching;
+                        if !now_touching {
+                            state.last_pen_up = Some(Instant::now());
+                        }
+                    }
+                }
                 if now_touching != touch_down {
                     let key_ev = key_event(btn_touch_code, if now_touching { 1 } else { 0 });
                     batch.insert(0, key_ev);

@@ -15,6 +15,7 @@ use crate::event::{
     parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
     EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
 };
+use crate::palm::SharedPalmState;
 use crate::ssh;
 
 const MT_SLOTS: usize = 16;
@@ -68,12 +69,20 @@ fn create_touchpad_device() -> Result<UinputDevice, Box<dyn std::error::Error + 
     Ok(device)
 }
 
-pub fn run(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run(
+    key_path: &Path,
+    palm: Option<SharedPalmState>,
+    grace_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_sess, mut channel) = ssh::open_input_stream(TOUCH_DEVICE, key_path)?;
-    run_mt(&mut channel)
+    run_mt(&mut channel, palm, grace_ms)
 }
 
-fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run_mt(
+    channel: &mut impl Read,
+    palm: Option<SharedPalmState>,
+    grace_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!("[touch] creating uinput MT touchpad (reMarkable 2 size)…");
     let device = create_touchpad_device()?;
     if let Ok(name) = device.sysname() {
@@ -172,6 +181,51 @@ fn run_mt(channel: &mut impl Read) -> Result<(), Box<dyn std::error::Error + Sen
                     }
                 }
                 pending_positions.clear();
+                let suppress = if let Some(ref palm_state) = palm {
+                    palm_state
+                        .lock()
+                        .map(|state| {
+                            state.pen_down
+                                || state
+                                    .last_pen_up
+                                    .map(|t| t.elapsed().as_millis() < grace_ms as u128)
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if suppress {
+                    let mut w = device.writer();
+                    for s in 0..MT_SLOTS {
+                        if slot_tracking_id[s].is_some() {
+                            let slot_w = w.slot(Slot::from(s as u16))?;
+                            w = slot_w
+                                .write(&[evdevil::event::AbsEvent::new(Abs::MT_TRACKING_ID, -1).into()])?
+                                .finish_slot()?;
+                            slot_tracking_id[s] = None;
+                        }
+                    }
+                    let key_events: Vec<evdevil::event::InputEvent> = [
+                        KeyEvent::new(Key::BTN_TOUCH, KeyState::RELEASED),
+                        KeyEvent::new(Key::BTN_TOOL_FINGER, KeyState::RELEASED),
+                        KeyEvent::new(Key::BTN_TOOL_DOUBLETAP, KeyState::RELEASED),
+                        KeyEvent::new(Key::BTN_TOOL_TRIPLETAP, KeyState::RELEASED),
+                        KeyEvent::new(Key::BTN_TOOL_QUADTAP, KeyState::RELEASED),
+                    ]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                    w = w.write(&key_events)?;
+                    w.finish()?;
+                    if count == 0 {
+                        log::info!("[touch] first event batch (events are flowing)");
+                    }
+                    frame_slot_active = slot_active;
+                    count += 1;
+                    log::debug!("[touch] frame #{} contacts=0 (palm suppressed)", count);
+                    continue;
+                }
                 let mut w = device.writer();
                 let finger_down = contact_count > 0;
                 for s in 0..MT_SLOTS {
