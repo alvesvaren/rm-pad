@@ -1,0 +1,5 @@
+# Allow users in the uinput group to create virtual input devices (required for rm-mouse).
+# Install: sudo cp data/50-uinput.rules /etc/udev/rules.d/
+# Then: sudo groupadd -f uinput && sudo usermod -aG uinput $USER
+# Log out and back in (or reboot), then run: sudo udevadm control --reload-rules
+KERNEL=="uinput", GROUP="uinput", MODE="0660"

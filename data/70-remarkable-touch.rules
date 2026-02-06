@@ -1,0 +1,4 @@
+# Tag rm-mouse virtual MT touchpad so libinput enables gestures and tap-to-click.
+# Device is absolute MT with reMarkable 2 size (1872×1404, resolution 9 units/mm).
+# Install: sudo cp data/70-remarkable-touch.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+KERNEL=="event*", ATTRS{name}=="reMarkable Touch", ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHPAD}="1"

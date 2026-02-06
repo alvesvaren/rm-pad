@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let touch_only = args.iter().any(|a| a == "--touch-only");
     let pen_only = args.iter().any(|a| a == "--pen-only");
+    let relative_touch = args.iter().any(|a| a == "--relative-touch");
     let run_pen = !touch_only;
     let run_touch = !pen_only;
 
@@ -42,8 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let key_path = Path::new(config::KEY_PATH);
 
     if !run_pen && !run_touch {
-        eprintln!("Usage: {} [--pen-only] [--touch-only]", args.get(0).unwrap_or(&"rm-mouse".into()));
-        eprintln!("  Default: run both pen and touch. Use one flag to run only that input.");
+        eprintln!(
+            "Usage: {} [--pen-only] [--touch-only] [--relative-touch]",
+            args.get(0).unwrap_or(&"rm-mouse".into())
+        );
+        eprintln!("  Default: run both pen and touch. --relative-touch: use REL mouse instead of MT touchpad (works if MT fails sanity checks).");
         std::process::exit(1);
     }
 
@@ -65,10 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let touch_handle = if run_touch {
         let key_touch = key_path.to_path_buf();
+        let rel = relative_touch;
         Some(thread::spawn(move || {
             loop {
                 log::info!("[touch] thread starting…");
-                if let Err(e) = touch::run(&key_touch) {
+                if let Err(e) = touch::run(&key_touch, rel) {
                     log::error!("[touch] {}", e);
                 }
                 log::warn!("[touch] disconnected, reconnecting in 2s…");

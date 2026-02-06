@@ -1,0 +1,3 @@
+# Relative touch device (--relative-touch): tag as mouse so libinput uses it.
+# Install: sudo cp data/70-remarkable-touch-rel.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+KERNEL=="event*", ATTRS{name}=="reMarkable Touch Rel", ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1"

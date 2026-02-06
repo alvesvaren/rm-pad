@@ -50,6 +50,8 @@ pub fn run(key_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Syn
     if let Ok(name) = device.sysname() {
         log::info!("[pen] uinput device created: /sys/devices/virtual/input/{}", name.to_string_lossy());
     }
+    // Give udev/libinput time to attach before sending events (kernel uinput docs).
+    std::thread::sleep(std::time::Duration::from_secs(1));
     log::info!("[pen] forwarding (move pen on tablet to see events)");
 
     let btn_touch_code = Key::BTN_TOUCH.raw();
