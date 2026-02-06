@@ -21,35 +21,32 @@ pub enum Orientation {
 
 impl Orientation {
     /// Transform touch coordinates from device space to output space.
-    /// 
-    /// Device touch coordinates: (0,0) is top-left in portrait mode.
-    /// Returns (out_x, out_y) in the rotated coordinate system.
+    /// Touch is natively portrait-oriented but with Y=0 at bottom.
     pub fn transform_touch(&self, x: i32, y: i32, x_max: i32, y_max: i32) -> (i32, i32) {
         match self {
-            Orientation::Portrait => (x, y),
+            // Portrait: flip Y only (device has Y=0 at bottom)
+            Orientation::Portrait => (x, y_max - y),
             // LandscapeRight: swap X/Y (original working behavior)
             Orientation::LandscapeRight => (y, x),
             // LandscapeLeft: swap X/Y and invert both
             Orientation::LandscapeLeft => (y_max - y, x_max - x),
-            // Inverted: invert both axes
-            Orientation::Inverted => (x_max - x, y_max - y),
+            // Inverted: flip Y and invert X
+            Orientation::Inverted => (x_max - x, y),
         }
     }
 
     /// Transform pen coordinates from device space to output space.
-    /// 
-    /// The pen digitizer on reMarkable is natively landscape-oriented,
-    /// so LandscapeRight is the identity transform (no change).
+    /// Pen is natively landscape-oriented (LandscapeRight = identity).
     pub fn transform_pen(&self, x: i32, y: i32, x_max: i32, y_max: i32) -> (i32, i32) {
         match self {
             // LandscapeRight: native pen orientation, no transform
             Orientation::LandscapeRight => (x, y),
-            // Portrait: swap X/Y (opposite of touch)
-            Orientation::Portrait => (y, x),
+            // Portrait: swap X/Y and flip what becomes Y
+            Orientation::Portrait => (y, x_max - x),
             // LandscapeLeft: invert both axes
             Orientation::LandscapeLeft => (x_max - x, y_max - y),
-            // Inverted: swap X/Y and invert both
-            Orientation::Inverted => (y_max - y, x_max - x),
+            // Inverted: swap X/Y and flip what becomes X
+            Orientation::Inverted => (y_max - y, x),
         }
     }
 
@@ -59,12 +56,12 @@ impl Orientation {
         match self {
             // LandscapeRight: native, no transform
             Orientation::LandscapeRight => (tilt_x, tilt_y),
-            // Portrait: swap tilt axes
-            Orientation::Portrait => (tilt_y, tilt_x),
+            // Portrait: swap tilt axes, negate new Y
+            Orientation::Portrait => (tilt_y, -tilt_x),
             // LandscapeLeft: invert both
             Orientation::LandscapeLeft => (-tilt_x, -tilt_y),
-            // Inverted: swap and invert
-            Orientation::Inverted => (-tilt_y, -tilt_x),
+            // Inverted: swap and negate new X
+            Orientation::Inverted => (-tilt_y, tilt_x),
         }
     }
 
