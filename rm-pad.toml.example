@@ -1,4 +1,4 @@
-# rm-pad config (TOML). Copy to rm-pad.toml or ~/.config/rm-pad/config.toml
+# rm-pad config (TOML). Copy to rm-pad.toml or ~/.config/rm-pad.toml
 
 host = "10.11.99.1"
 # key_path = "~/.ssh/id_rsa"

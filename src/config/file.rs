@@ -84,12 +84,7 @@ fn default_config_paths() -> Vec<PathBuf> {
     paths.push(PathBuf::from("rm-pad.toml"));
 
     if let Ok(home) = std::env::var("HOME") {
-        paths.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("rm-pad")
-                .join("config.toml"),
-        );
+        paths.push(PathBuf::from(home).join(".config").join("rm-pad.toml"));
     }
 
     paths

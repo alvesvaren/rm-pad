@@ -114,9 +114,9 @@ The service will automatically start when you connect the reMarkable via USB and
 Config file search order:
 1. `RMPAD_CONFIG` environment variable (if set)
 2. `./rm-pad.toml` (current directory)
-3. `~/.config/rm-pad/config.toml` (user config directory)
+3. `~/.config/rm-pad.toml` (user config directory)
 
-Copy the `rm-pad.toml.example` file to one of these locations (recommended: `~/.config/rm-pad/config.toml`) and change the options to your preferences.
+Copy the `rm-pad.toml.example` file to one of these locations (recommended: `~/.config/rm-pad.toml`) and change the options to your preferences.
 
 ### Connection settings
 
