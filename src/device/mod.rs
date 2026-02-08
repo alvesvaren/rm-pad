@@ -63,7 +63,7 @@ impl DeviceProfile {
         log::debug!("Detected remote device model: {}", model);
 
         // Check for rMPP first (more specific)
-        if model.contains("reMarkable Paper Pro") {
+        if model.contains("reMarkable Ferrari") {
             log::info!("Detected reMarkable Paper Pro");
             return Ok(&RMPP);
         }
