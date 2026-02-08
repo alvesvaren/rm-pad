@@ -15,20 +15,13 @@ Features:
 
 ## Installation
 
-Either build it yourself, use the prebuilt binaries from GitHub releases, or install from AUR (Arch Linux).
+Either build it yourself, use the prebuilt binaries from GitHub releases.
 
-### Arch Linux (AUR)
+### Arch Linux
 
-Install from AUR using your preferred AUR helper:
+I haven't added this to the AUR yet, but I've created a PKGBUILD, so you can install it easily on arch:
 
-```bash
-# Using yay
-yay -S rm-pad
-
-# Using paru
-paru -S rm-pad
-
-# Or manually
+```
 git clone https://aur.archlinux.org/rm-pad.git
 cd rm-pad
 makepkg -si
