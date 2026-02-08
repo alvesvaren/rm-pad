@@ -76,6 +76,12 @@ fn connect_and_authenticate(
     Ok(session)
 }
 
+/// Connect to the device via SSH for device detection purposes.
+/// Returns None if connection fails (e.g., device not available).
+pub fn connect_for_detection(config: &Config) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
+    connect_and_authenticate(config)
+}
+
 fn authenticate(
     session: &mut Session,
     auth: &Auth,

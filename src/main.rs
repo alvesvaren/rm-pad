@@ -22,10 +22,16 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let device = DeviceProfile::current();
-    let config = Config::load(&cli, device);
-
+    
     init_logging(cli.command.is_some());
+    
+    // Detect device via SSH (required)
+    let config_for_detection = Config::load(&cli, DeviceProfile::current());
+    let session = ssh::connect_for_detection(&config_for_detection)?;
+    let device = DeviceProfile::detect_via_ssh(&session)?;
+    log::info!("Using device profile: {}", device.name);
+    
+    let config = Config::load(&cli, device);
 
     if let Some(command) = cli.command {
         return run_subcommand(command, &config);
