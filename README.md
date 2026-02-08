@@ -34,7 +34,7 @@ cd rm-pad
 makepkg -si
 ```
 
-The package includes udev rules and systemd service files. After installation, follow the setup instructions below.
+The package includes a udev rule for uinput access and a systemd user service. After installation, follow the setup instructions below.
 
 ### Building from source
 
@@ -86,14 +86,12 @@ sudo udevadm control --reload-rules
 
 #### Systemd Service (optional, for automatic startup)
 
-To automatically start rm-pad when the reMarkable is connected via USB:
+rm-pad can run as a persistent user service that automatically reconnects whenever the tablet becomes reachable:
 
-1. Install the systemd service and udev rule:
+1. Install the systemd service:
 ```bash
 mkdir -p ~/.config/systemd/user
-cp data/rm-pad@.service ~/.config/systemd/user/
-sudo cp data/70-rm-pad.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
+cp data/rm-pad.service ~/.config/systemd/user/
 ```
 
 2. Enable lingering for your user (allows user services to run without being logged in):
@@ -101,13 +99,12 @@ sudo udevadm control --reload-rules
 loginctl enable-linger $USER
 ```
 
-3. Enable the service:
+3. Enable and start the service:
 ```bash
-systemctl --user enable rm-pad@usb0.service
-systemctl --user start rm-pad@usb0.service
+systemctl --user enable --now rm-pad.service
 ```
 
-The service will automatically start when you connect the reMarkable via USB and stop when disconnected. Replace `usb0` with your actual USB network interface name if different.
+The service runs in the background and handles connection/disconnection automatically — just plug in your tablet and it starts forwarding input. When you unplug, it detects the disconnection and waits for the next connection.
 
 ## Configuration
 

@@ -7,6 +7,7 @@ mod orientation;
 mod palm;
 mod ssh;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -80,10 +81,24 @@ fn run_input_forwarding(config: Config, device: &'static DeviceProfile) -> Resul
     let palm_state = create_palm_state(&config);
     let config = Arc::new(config);
 
+    // Start watchdog thread if grabbing is enabled
+    let watchdog_stop = if config.grab_input {
+        Some(ssh::spawn_watchdog(&config))
+    } else {
+        None
+    };
+
     let pen_handle = spawn_pen_thread(&config, device, &palm_state);
     let touch_handle = spawn_touch_thread(&config, device, &palm_state);
 
-    join_threads(pen_handle, touch_handle)
+    let result = join_threads(pen_handle, touch_handle);
+
+    // Stop watchdog thread
+    if let Some(stop_flag) = watchdog_stop {
+        stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    result
 }
 
 fn create_palm_state(config: &Config) -> Option<SharedPalmState> {
@@ -135,19 +150,26 @@ fn spawn_touch_thread(
     }))
 }
 
+/// Delay between reconnection attempts.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
 fn run_with_reconnect<F>(name: &str, mut run_fn: F)
 where
     F: FnMut() -> Result<()>,
 {
     loop {
-        log::info!("[{}] Starting", name);
+        log::info!("[{}] Connecting", name);
 
         if let Err(e) = run_fn() {
             log::error!("[{}] Error: {}", name, e);
         }
 
-        log::warn!("[{}] Disconnected, reconnecting in 2s", name);
-        thread::sleep(Duration::from_secs(2));
+        log::warn!(
+            "[{}] Disconnected, reconnecting in {}s",
+            name,
+            RECONNECT_DELAY.as_secs()
+        );
+        thread::sleep(RECONNECT_DELAY);
     }
 }
 

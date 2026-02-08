@@ -1,12 +1,10 @@
 [Unit]
 Description=rm-pad input forwarding for reMarkable tablet
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/rm-pad
-Restart=on-failure
+Restart=always
 RestartSec=5
 Environment="RMPAD_HOST=10.11.99.1"
 

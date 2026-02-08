@@ -1,9 +1,21 @@
-use std::net::TcpStream;
+use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
+use socket2::SockRef;
 use ssh2::Session;
 
 use crate::config::{Auth, Config};
 use crate::grab;
+
+/// Watchdog file path on the tablet
+pub const WATCHDOG_FILE: &str = "/tmp/rm-pad-watchdog";
+
+/// How often to touch the watchdog file
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Guard that ensures remote grab processes are killed when dropped.
 pub struct GrabCleanup {
@@ -35,6 +47,18 @@ impl Drop for GrabCleanup {
 
 const SSH_USER: &str = "root";
 const SSH_PORT: u16 = 22;
+
+/// Timeout for the initial TCP connection attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long before TCP sends the first keepalive probe on an idle connection.
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(5);
+
+/// Interval between TCP keepalive probes.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of unanswered probes before TCP considers the connection dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 /// Open an SSH connection and stream input from a device.
 ///
@@ -71,12 +95,27 @@ pub fn open_input_stream(
 fn connect_and_authenticate(
     config: &Config,
 ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
-    let tcp = TcpStream::connect((config.host.as_str(), SSH_PORT))?;
-    let mut session = Session::new()?;
+    let addr = (config.host.as_str(), SSH_PORT)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("Could not resolve host address")?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
 
+    // Enable TCP keepalive so the OS kernel detects dead connections quickly.
+    // Without this a silently-dropped connection (e.g. USB cable unplugged)
+    // can block reads for minutes waiting for the default TCP timeout.
+    // With these settings the kernel detects a dead peer in roughly
+    // KEEPALIVE_TIME + KEEPALIVE_INTERVAL * KEEPALIVE_RETRIES ≈ 20 seconds.
+    let sock = SockRef::from(&tcp);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    sock.set_tcp_keepalive(&keepalive)?;
+
+    let mut session = Session::new()?;
     session.set_tcp_stream(tcp);
     session.handshake()?;
-
     authenticate(&mut session, &config.auth())?;
 
     Ok(session)
@@ -122,4 +161,61 @@ fn build_stream_command(device_path: &str, grab: bool) -> String {
     } else {
         format!("cat {}", device_path)
     }
+}
+
+/// Spawn a thread that periodically touches the watchdog file on the tablet.
+/// Returns a stop flag that can be set to stop the watchdog.
+pub fn spawn_watchdog(config: &Config) -> Arc<AtomicBool> {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_clone = stop_flag.clone();
+    let host = config.host.clone();
+    let auth = config.auth();
+
+    thread::spawn(move || {
+        log::info!("Watchdog thread started");
+
+        loop {
+            if stop_flag_clone.load(Ordering::Relaxed) {
+                log::debug!("Watchdog thread stopping");
+                break;
+            }
+
+            // Try to connect and touch the watchdog file
+            match touch_watchdog(&host, &auth) {
+                Ok(()) => {
+                    log::trace!("Watchdog file touched");
+                }
+                Err(e) => {
+                    log::warn!("Failed to touch watchdog: {}", e);
+                }
+            }
+
+            thread::sleep(WATCHDOG_INTERVAL);
+        }
+    });
+
+    stop_flag
+}
+
+fn touch_watchdog(host: &str, auth: &Auth) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = (host, SSH_PORT)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("Could not resolve host address")?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+
+    let mut session = Session::new()?;
+    session.set_tcp_stream(tcp);
+    session.handshake()?;
+    authenticate(&mut session, auth)?;
+
+    let mut channel = session.channel_session()?;
+    channel.exec(&format!("touch {}", WATCHDOG_FILE))?;
+
+    // Read any output and wait for the command to complete
+    let mut output = String::new();
+    channel.read_to_string(&mut output)?;
+    channel.wait_close()?;
+
+    Ok(())
 }

@@ -1,8 +1,0 @@
-# Trigger rm-pad service when reMarkable USB network interface appears
-# The reMarkable tablet creates a USB network interface (typically usb0) when connected via USB
-
-ACTION=="add", SUBSYSTEM=="net", KERNEL=="usb*", \
-  RUN+="/bin/sh -c 'systemctl --user --no-block start rm-pad@%k.service || true'"
-
-ACTION=="remove", SUBSYSTEM=="net", KERNEL=="usb*", \
-  RUN+="/bin/sh -c 'systemctl --user --no-block stop rm-pad@%k.service || true'"

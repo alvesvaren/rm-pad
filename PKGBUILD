@@ -25,9 +25,8 @@ package() {
   install -Dm755 "$srcdir/target/release/rm-pad" "$pkgdir/usr/bin/rm-pad"
 
   install -Dm644 data/50-uinput.rules "$pkgdir/usr/lib/udev/rules.d/50-uinput.rules"
-  install -Dm644 data/70-rm-pad.rules "$pkgdir/usr/lib/udev/rules.d/70-rm-pad.rules"
 
-  install -Dm644 data/rm-pad@.service "$pkgdir/usr/lib/systemd/user/rm-pad@.service"
+  install -Dm644 data/rm-pad.service "$pkgdir/usr/lib/systemd/user/rm-pad.service"
 
   install -Dm644 rm-pad.toml.example "$pkgdir/usr/share/rm-pad/rm-pad.toml.example"
 
