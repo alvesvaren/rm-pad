@@ -121,21 +121,6 @@ fn remove_remote_binary(
     Ok(())
 }
 
-/// Kill any existing rm-pad-grab processes on the tablet.
-pub fn kill_existing_processes(
-    session: &Session,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut channel = session.channel_session()?;
-    channel.exec("kill -9 $(pidof rm-pad-grab) 2>/dev/null || true")?;
-
-    // Explicitly close our end so the session is left in a clean state
-    channel.close()?;
-    channel.wait_close()?;
-
-    log::debug!("Killed any existing rm-pad-grab processes");
-    Ok(())
-}
-
 /// Upload the correct grab helper binary to the tablet.
 ///
 /// Pipes the binary through `cat` into a file on the tablet and marks it

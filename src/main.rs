@@ -81,8 +81,17 @@ fn run_input_forwarding(config: Config, device: &'static DeviceProfile) -> Resul
     let palm_state = create_palm_state(&config);
     let config = Arc::new(config);
 
-    // Start watchdog thread if grabbing is enabled
+    // If grabbing, touch the watchdog file FIRST, then start watchdog thread
     let watchdog_stop = if config.grab_input {
+        // Touch once before starting anything - this ensures the file exists
+        // and is fresh before any grabber starts
+        log::info!("Touching watchdog file before starting...");
+        if let Err(e) = ssh::touch_watchdog_once(&config) {
+            log::error!("Failed to touch watchdog: {}", e);
+            return Err(e);
+        }
+
+        // Now start the background watchdog thread
         Some(ssh::spawn_watchdog(&config))
     } else {
         None
