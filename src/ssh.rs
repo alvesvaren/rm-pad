@@ -18,14 +18,6 @@ impl GrabCleanup {
             grab_enabled,
         }
     }
-
-    pub fn session(&self) -> &Session {
-        self.session.as_ref().unwrap()
-    }
-
-    pub fn into_session(mut self) -> Session {
-        self.session.take().unwrap()
-    }
 }
 
 impl Drop for GrabCleanup {
