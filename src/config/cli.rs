@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::orientation::Orientation;
 
 #[derive(Parser)]
-#[command(name = "rm-mouse")]
+#[command(name = "rm-pad")]
 #[command(about = "Forward reMarkable tablet input to your computer")]
 #[command(version)]
 pub struct Cli {
@@ -12,7 +12,7 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// reMarkable host (IP or hostname)
-    #[arg(long, env = "RMMOUSE_HOST")]
+    #[arg(long, env = "RMPAD_HOST")]
     pub host: Option<String>,
 
     /// SSH key path for authentication
@@ -20,7 +20,7 @@ pub struct Cli {
     pub key_path: Option<String>,
 
     /// SSH password (if set, key_path is ignored)
-    #[arg(long, env = "RMMOUSE_PASSWORD")]
+    #[arg(long, env = "RMPAD_PASSWORD")]
     pub password: Option<String>,
 
     /// Pen input device path on reMarkable
@@ -60,7 +60,7 @@ pub struct Cli {
     pub orientation: Option<Orientation>,
 
     /// Path to config file
-    #[arg(long, env = "RMMOUSE_CONFIG")]
+    #[arg(long, env = "RMPAD_CONFIG")]
     pub config: Option<PathBuf>,
 }
 

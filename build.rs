@@ -36,7 +36,7 @@ fn build_helper(arch: &str, out_dir: &PathBuf) {
             panic!(
                 "Failed to run cross-compiler '{}': {}\n\
                  \n\
-                 To build rm-mouse you need C cross-compilers for ARM.\n\
+                 To build rm-pad you need C cross-compilers for ARM.\n\
                  \n\
                  On Ubuntu/Debian:\n\
                  \x20 sudo apt install gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu\n\

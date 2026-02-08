@@ -17,7 +17,7 @@ use ssh2::Session;
 const GRAB_ARMV7: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/evgrab-armv7"));
 const GRAB_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/evgrab-aarch64"));
 
-const REMOTE_PATH: &str = "/tmp/rm-mouse-grab";
+const REMOTE_PATH: &str = "/tmp/rm-pad-grab";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Arch {
@@ -121,18 +121,18 @@ fn remove_remote_binary(
     Ok(())
 }
 
-/// Kill any existing rm-mouse-grab processes on the tablet.
+/// Kill any existing rm-pad-grab processes on the tablet.
 pub fn kill_existing_processes(
     session: &Session,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut channel = session.channel_session()?;
-    channel.exec("kill -9 $(pidof rm-mouse-grab) 2>/dev/null || true")?;
+    channel.exec("kill -9 $(pidof rm-pad-grab) 2>/dev/null || true")?;
 
     // Explicitly close our end so the session is left in a clean state
     channel.close()?;
     channel.wait_close()?;
 
-    log::debug!("Killed any existing rm-mouse-grab processes");
+    log::debug!("Killed any existing rm-pad-grab processes");
     Ok(())
 }
 

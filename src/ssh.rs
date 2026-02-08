@@ -104,7 +104,7 @@ fn authenticate(
 
 /// Detect the tablet architecture and upload the grab helper via SFTP.
 fn prepare_grab(session: &Session) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Kill any existing rm-mouse-grab processes before starting a new one
+    // Kill any existing rm-pad-grab processes before starting a new one
     grab::kill_existing_processes(session)?;
 
     let arch = grab::detect_arch(session)?;

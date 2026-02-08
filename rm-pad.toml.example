@@ -1,5 +1,5 @@
-# rm-mouse config (TOML). Copy to rm-mouse.toml or ~/.config/rm-mouse/config.toml
-# Config file search order: RMMOUSE_CONFIG env, ./rm-mouse.toml, ~/.config/rm-mouse/config.toml
+# rm-pad config (TOML). Copy to rm-pad.toml or ~/.config/rm-pad/config.toml
+# Config file search order: RMPAD_CONFIG env, ./rm-pad.toml, ~/.config/rm-pad/config.toml
 
 # --- Connection ---
 host = "10.11.99.1"

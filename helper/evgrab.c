@@ -5,7 +5,7 @@
  * When this process exits (SSH disconnect, signal, etc.), the kernel
  * automatically releases the grab and the UI resumes normal input.
  *
- * Cross-compiled for ARM and embedded in the rm-mouse host binary.
+ * Cross-compiled for ARM and embedded in the rm-pad host binary.
  * Uploaded to /tmp on the reMarkable at runtime.
  */
 

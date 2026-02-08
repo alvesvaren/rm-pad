@@ -1,5 +1,5 @@
-# reMarkable Pen (rm-mouse virtual tablet)
-# Used when forwarding reMarkable pen over SSH via rm-mouse.
+# reMarkable Pen (rm-pad virtual tablet)
+# Used when forwarding reMarkable pen over SSH via rm-pad.
 # Install: copy to /usr/share/libwacom/ (or use libwacom's --datadir).
 # DeviceMatch must match the uinput device: bus USB (0x03), vendor 0x2d1f, product 0x0001.
 

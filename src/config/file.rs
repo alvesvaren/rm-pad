@@ -59,13 +59,13 @@ pub fn load_from_default_paths() -> Option<FileConfig> {
 fn default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    paths.push(PathBuf::from("rm-mouse.toml"));
+    paths.push(PathBuf::from("rm-pad.toml"));
 
     if let Ok(home) = std::env::var("HOME") {
         paths.push(
             PathBuf::from(home)
                 .join(".config")
-                .join("rm-mouse")
+                .join("rm-pad")
                 .join("config.toml"),
         );
     }
