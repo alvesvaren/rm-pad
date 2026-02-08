@@ -102,6 +102,7 @@ fn find_compiler(arch: &str) -> String {
 fn compiler_candidates(arch: &str) -> Vec<&'static str> {
     match arch {
         "armv7" => vec![
+            "arm-none-linux-gnueabihf-gcc",
             "arm-linux-musleabihf-gcc",
             "arm-linux-gnueabihf-gcc",
         ],
@@ -115,7 +116,7 @@ fn compiler_candidates(arch: &str) -> Vec<&'static str> {
 
 fn find_tool(tool: &str, arch: &str) -> Option<String> {
     let prefixes = match arch {
-        "armv7" => &["arm-linux-musleabihf-", "arm-linux-gnueabihf-"][..],
+        "armv7" => &["arm-none-linux-gnueabihf-", "arm-linux-musleabihf-", "arm-linux-gnueabihf-"][..],
         "aarch64" => &["aarch64-linux-musl-", "aarch64-linux-gnu-"][..],
         _ => return None,
     };
