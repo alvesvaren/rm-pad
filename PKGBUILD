@@ -1,6 +1,6 @@
 # Maintainer: Your Name <your.email@example.com>
 pkgname=rm-pad
-pkgver=0.1.2
+pkgver=0.1.3
 pkgrel=1
 pkgdesc="Forward reMarkable tablet input to your computer as libinput devices"
 arch=('x86_64')
