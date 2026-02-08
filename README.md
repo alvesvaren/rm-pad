@@ -87,17 +87,14 @@ mkdir -p ~/.config/systemd/user
 cp data/rm-pad.service ~/.config/systemd/user/
 ```
 
-2. Enable lingering for your user (allows user services to run without being logged in):
-```bash
-loginctl enable-linger $USER
-```
-
-3. Enable and start the service:
+2. Enable and start the service:
 ```bash
 systemctl --user enable --now rm-pad.service
 ```
 
 The service runs in the background and handles connection/disconnection automatically — just plug in your tablet and it starts forwarding input. When you unplug, it detects the disconnection and waits for the next connection.
+
+> This defaults to only running when connected over USB. You can modify the service file if you want it to work over wifi, but then you can't use your remarkable while on wifi and the experience is often subpar over a wireless connection.
 
 ## Configuration
 
