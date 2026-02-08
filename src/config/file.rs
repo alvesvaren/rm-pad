@@ -19,7 +19,7 @@ pub struct FileConfig {
     #[serde(default)]
     pub pen_only: bool,
     #[serde(default)]
-    pub stop_ui: bool,
+    pub grab_input: bool,
     #[serde(default)]
     pub no_palm_rejection: bool,
     pub palm_grace_ms: Option<u64>,

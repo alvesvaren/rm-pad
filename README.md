@@ -7,7 +7,7 @@ Features:
 - Touch input (multi-touch gestures, tapping and moving)
 - Configurable palm rejection (disables touch input for a configurable grace period if any pen input is detected, default 500ms)
 - Screen orientation support (portrait, landscape-right, landscape-left, inverted)
-- Optional input grab so the tablet UI doesn't see input: with `--stop-ui` or `stop_ui = true` in config, a small helper binary is uploaded to `/tmp` on the tablet and uses `EVIOCGRAB` to exclusively grab the input devices. The tablet UI (xochitl) keeps running but receives no pen/touch events. The grab is automatically released when rm-pad exits or the SSH connection drops — no reboot or manual cleanup needed.
+- Input grab (enabled by default): A small helper binary is uploaded to `/tmp` on the tablet and uses `EVIOCGRAB` to exclusively grab the input devices. The tablet UI (xochitl) keeps running but receives no pen/touch events. The grab is automatically released when rm-pad exits or the SSH connection drops — no reboot or manual cleanup needed. Use `--no-grab-input` to disable.
 - Works over both wifi and USB
 - Very low latency (as long as your connection to the tablet is fast)
 - Runs in userspace (as long as your user is allowed to create input devices)
@@ -15,7 +15,26 @@ Features:
 
 ## Installation
 
-Either build it yourself or use the prebuilt binaries from GitHub releases.
+Either build it yourself, use the prebuilt binaries from GitHub releases, or install from AUR (Arch Linux).
+
+### Arch Linux (AUR)
+
+Install from AUR using your preferred AUR helper:
+
+```bash
+# Using yay
+yay -S rm-pad
+
+# Using paru
+paru -S rm-pad
+
+# Or manually
+git clone https://aur.archlinux.org/rm-pad.git
+cd rm-pad
+makepkg -si
+```
+
+The package includes udev rules and systemd service files. After installation, follow the setup instructions below.
 
 ### Building from source
 
@@ -38,7 +57,19 @@ Then build with:
 cargo build --release
 ```
 
-### Setup (required for userspace operation)
+### Setup
+
+#### SSH Authentication
+
+For passwordless SSH access, copy your SSH key to the tablet:
+
+```bash
+ssh-copy-id root@10.11.99.1
+```
+
+If connecting over WiFi, replace `10.11.99.1` with your tablet's IP address. The default password is usually `root` (or check your reMarkable documentation).
+
+#### Udev Rules (required for userspace operation)
 
 To allow rm-pad to create virtual input devices, you need to set up udev rules:
 
@@ -53,6 +84,31 @@ Then log out and back in (or reboot), and reload udev rules:
 sudo udevadm control --reload-rules
 ```
 
+#### Systemd Service (optional, for automatic startup)
+
+To automatically start rm-pad when the reMarkable is connected via USB:
+
+1. Install the systemd service and udev rule:
+```bash
+mkdir -p ~/.config/systemd/user
+cp data/rm-pad@.service ~/.config/systemd/user/
+sudo cp data/70-rm-pad.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+```
+
+2. Enable lingering for your user (allows user services to run without being logged in):
+```bash
+loginctl enable-linger $USER
+```
+
+3. Enable the service:
+```bash
+systemctl --user enable rm-pad@usb0.service
+systemctl --user start rm-pad@usb0.service
+```
+
+The service will automatically start when you connect the reMarkable via USB and stop when disconnected. Replace `usb0` with your actual USB network interface name if different.
+
 ## Configuration
 
 Config file search order:
@@ -65,7 +121,7 @@ Copy the `rm-pad.toml.example` file to one of these locations (recommended: `~/.
 ### Connection settings
 
 - **host**: reMarkable tablet IP address or hostname. Default is `10.11.99.1` (USB connection). For WiFi, use your tablet's IP address.
-- **key_path**: Path to SSH private key for authentication (default: `"rm-key"`). Only used if `password` is not set.
+- **key_path**: Path to SSH private key for authentication. Defaults to your default SSH key (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, etc.). Only used if `password` is not set.
 - **password**: Root password for SSH authentication. If set, `key_path` is ignored. **Warning**: Restrict file permissions with `chmod 600` if storing password in config file.
 
 You can also use environment variables:
@@ -77,7 +133,7 @@ You can also use environment variables:
 
 - **touch_only**: Run touch input only (no pen)
 - **pen_only**: Run pen input only (no touch)
-- **stop_ui**: Stop xochitl UI while streaming input (uses input grab)
+- **grab_input**: Grab input exclusively (prevents tablet UI from seeing input, default: `true`)
 - **no_palm_rejection**: Disable palm rejection
 - **palm_grace_ms**: Palm rejection grace period in milliseconds (default: 500)
 - **orientation**: Screen orientation - `portrait`, `landscape-right` (default), `landscape-left`, or `inverted`

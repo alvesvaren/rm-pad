@@ -126,7 +126,7 @@ pub fn run_touch(
     palm: Option<SharedPalmState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_cleanup, mut channel) =
-        ssh::open_input_stream(&config.touch_device, config, config.stop_ui)?;
+        ssh::open_input_stream(&config.touch_device, config, config.grab_input)?;
 
     log::info!("Creating touch uinput device");
     let uinput = create_touchpad_device(device_profile, config.orientation)?;

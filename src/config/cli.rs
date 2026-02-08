@@ -39,13 +39,13 @@ pub struct Cli {
     #[arg(long)]
     pub pen_only: bool,
 
-    /// Stop xochitl UI while streaming input
+    /// Grab input exclusively (prevents tablet UI from seeing input)
     #[arg(long)]
-    pub stop_ui: bool,
+    pub grab_input: bool,
 
-    /// Keep xochitl UI running (overrides config file)
+    /// Don't grab input (tablet UI will also see input)
     #[arg(long)]
-    pub no_stop_ui: bool,
+    pub no_grab_input: bool,
 
     /// Disable palm rejection
     #[arg(long)]
