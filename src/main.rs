@@ -52,11 +52,15 @@ fn init_logging(is_dump: bool) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 }
 
-fn run_subcommand(command: Command, config: &Config, device: &'static DeviceProfile) -> Result<()> {
+fn run_subcommand(
+    command: Command,
+    config: &Config,
+    device_profile: &'static DeviceProfile,
+) -> Result<()> {
     match command {
         Command::Dump { device } => match device.as_str() {
-            "touch" => dump::run_touch(config, device),
-            "pen" => dump::run_pen(config, device),
+            "touch" => dump::run_touch(config, device_profile),
+            "pen" => dump::run_pen(config, device_profile),
             _ => {
                 eprintln!("Unknown dump device: {}. Use 'touch' or 'pen'.", device);
                 std::process::exit(1);
