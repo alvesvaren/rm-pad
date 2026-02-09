@@ -11,8 +11,8 @@ pub const RM2: DeviceProfile = DeviceProfile {
     pen_tilt_range: 6400,
 
     // Touch screen: 1872×1404 display, ~210×158 mm → ~9 units/mm
-    touch_x_max: 1871,
-    touch_y_max: 1403,
+    touch_x_max: 1403,
+    touch_y_max: 1871,
     touch_resolution: 9,
 
     // Default device paths
