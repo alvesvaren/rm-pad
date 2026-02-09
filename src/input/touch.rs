@@ -13,7 +13,7 @@ use crate::ssh;
 
 use super::event::{
     parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
-    EV_ABS, EV_KEY, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT,
+    EV_ABS, EV_KEY, EV_SYN, SYN_REPORT,
 };
 
 const MT_SLOTS: usize = 16;
@@ -149,7 +149,7 @@ fn run_event_loop(
     palm: Option<SharedPalmState>,
     grace_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut buf = [0u8; INPUT_EVENT_SIZE];
+    let mut buf = vec![0u8; device.input_event_size];
     let mut slots = SlotState::new();
     let mut frame = FrameState::new();
     let mut next_tracking_id: i32 = 0;

@@ -11,7 +11,7 @@ use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
 use crate::ssh;
 
-use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, INPUT_EVENT_SIZE, SYN_REPORT};
+use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, SYN_REPORT};
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -58,7 +58,7 @@ pub fn run_pen(
     log::info!("Pen forwarding started");
 
     let btn_touch_code = Key::BTN_TOUCH.raw();
-    let mut buf = [0u8; INPUT_EVENT_SIZE];
+    let mut buf = vec![0u8; device_profile.input_event_size];
     let mut batch: Vec<InputEvent> = Vec::with_capacity(32);
     let mut touch_down = false;
     let mut frame_count: u64 = 0;

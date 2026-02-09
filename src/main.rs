@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     let config = Config::load(&cli, device);
 
     if let Some(command) = cli.command {
-        return run_subcommand(command, &config);
+        return run_subcommand(command, &config, device);
     }
 
     if let Err(msg) = config.validate() {
@@ -52,11 +52,11 @@ fn init_logging(is_dump: bool) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 }
 
-fn run_subcommand(command: Command, config: &Config) -> Result<()> {
+fn run_subcommand(command: Command, config: &Config, device: &'static DeviceProfile) -> Result<()> {
     match command {
         Command::Dump { device } => match device.as_str() {
-            "touch" => dump::run_touch(config),
-            "pen" => dump::run_pen(config),
+            "touch" => dump::run_touch(config, device),
+            "pen" => dump::run_pen(config, device),
             _ => {
                 eprintln!("Unknown dump device: {}. Use 'touch' or 'pen'.", device);
                 std::process::exit(1);

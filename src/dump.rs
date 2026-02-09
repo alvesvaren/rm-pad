@@ -1,19 +1,27 @@
 use std::io::Read;
 
 use crate::config::Config;
-use crate::input::{parse_input_event, INPUT_EVENT_SIZE};
+use crate::device::DeviceProfile;
+use crate::input::parse_input_event;
 use crate::ssh;
 
-pub fn run_touch(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_dump(config, &config.touch_device, "touch")
+pub fn run_touch(
+    config: &Config,
+    device: &DeviceProfile,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_dump(config, device.input_event_size, &config.touch_device, "touch")
 }
 
-pub fn run_pen(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_dump(config, &config.pen_device, "pen")
+pub fn run_pen(
+    config: &Config,
+    device: &DeviceProfile,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_dump(config, device.input_event_size, &config.pen_device, "pen")
 }
 
 fn run_dump(
     config: &Config,
+    input_event_size: usize,
     device: &str,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -21,7 +29,7 @@ fn run_dump(
 
     eprintln!("Dumping {} events from {} (Ctrl+C to stop)\n", name, device);
 
-    let mut buf = [0u8; INPUT_EVENT_SIZE];
+    let mut buf = vec![0u8; input_event_size];
     let mut count: u64 = 0;
 
     loop {

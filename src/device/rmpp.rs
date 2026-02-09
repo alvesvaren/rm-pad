@@ -10,6 +10,9 @@ use super::DeviceProfile;
 pub const RMPP: DeviceProfile = DeviceProfile {
     name: "reMarkable Paper Pro",
 
+    // 64-bit ARM input_event struct size
+    input_event_size: 24,
+
     pen_x_max: 11180,
     pen_y_max: 15340,
     pen_pressure_max: 4096,

@@ -12,6 +12,9 @@ pub struct DeviceProfile {
     #[allow(dead_code)]
     pub name: &'static str,
 
+    // Raw input_event size on the device (bytes)
+    pub input_event_size: usize,
+
     // Pen digitizer ranges
     pub pen_x_max: i32,
     pub pen_y_max: i32,

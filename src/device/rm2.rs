@@ -3,6 +3,9 @@ use super::DeviceProfile;
 pub const RM2: DeviceProfile = DeviceProfile {
     name: "reMarkable 2",
 
+    // 32-bit ARM input_event struct size
+    input_event_size: 16,
+
     // Pen digitizer ranges (from device dumps)
     pen_x_max: 20967,
     pen_y_max: 15725,
