@@ -121,29 +121,16 @@ fn build_stream_command(device_path: &str, grab: bool) -> String {
 /// Touch the watchdog file once. Blocks until success or error.
 /// This MUST be called before starting grabbers.
 pub fn touch_watchdog_once(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = (config.host.as_str(), SSH_PORT)
-        .to_socket_addrs()?
-        .next()
-        .ok_or("Could not resolve host address")?;
-    let tcp = TcpStream::connect_timeout(&addr, SSH_TIMEOUT)?;
-
-    let mut session = Session::new()?;
-    session.set_tcp_stream(tcp);
-    session.handshake()?;
-    authenticate(&mut session, &config.auth())?;
-
-    let mut channel = session.channel_session()?;
-    channel.exec(&format!("touch {}", WATCHDOG_FILE))?;
-
-    let mut output = String::new();
-    channel.read_to_string(&mut output)?;
-    channel.wait_close()?;
-
+    let session = connect_to_host(&config.host, &config.auth())?;
+    touch_watchdog_on_session(&session)?;
     log::info!("Watchdog file touched");
     Ok(())
 }
 
 /// Spawn a thread that periodically touches the watchdog file.
+/// Uses a persistent SSH connection to avoid the connection churn that caused
+/// periodic lag spikes over WiFi (opening a new connection every 2 seconds
+/// competed with the pen/touch data streams).
 /// Returns a stop flag.
 pub fn spawn_watchdog(config: &Config) -> Arc<AtomicBool> {
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -154,24 +141,68 @@ pub fn spawn_watchdog(config: &Config) -> Arc<AtomicBool> {
     thread::spawn(move || {
         log::info!("Watchdog thread started");
 
+        let mut session: Option<Session> = match connect_to_host(&host, &auth) {
+            Ok(s) => {
+                log::info!("Watchdog connected (persistent connection)");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("Watchdog initial connect failed: {}", e);
+                // Will retry in loop
+                None
+            }
+        };
+
         loop {
             if stop_flag_clone.load(Ordering::Relaxed) {
                 log::debug!("Watchdog thread stopping");
                 break;
             }
 
-            if let Err(e) = touch_watchdog(&host, &auth) {
-                log::warn!("Watchdog touch failed: {}", e);
-            }
+            let touch_ok = match &mut session {
+                Some(s) => {
+                    match touch_watchdog_on_session(s) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Watchdog touch failed (will reconnect): {}", e);
+                            session = None;
+                            false
+                        }
+                    }
+                }
+                None => {
+                    match connect_to_host(&host, &auth) {
+                        Ok(s) => {
+                            log::info!("Watchdog reconnected");
+                            session = Some(s);
+                            // Touch on next iteration to avoid double delay
+                            false
+                        }
+                        Err(e) => {
+                            log::warn!("Watchdog reconnect failed: {}", e);
+                            false
+                        }
+                    }
+                }
+            };
 
-            thread::sleep(WATCHDOG_INTERVAL);
+            if touch_ok {
+                thread::sleep(WATCHDOG_INTERVAL);
+            } else {
+                // Brief delay before reconnect attempt to avoid tight loop
+                thread::sleep(Duration::from_millis(500));
+            }
         }
     });
 
     stop_flag
 }
 
-fn touch_watchdog(host: &str, auth: &Auth) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Connect to host with given auth. Used by watchdog to establish persistent connection.
+fn connect_to_host(
+    host: &str,
+    auth: &Auth,
+) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     let addr = (host, SSH_PORT)
         .to_socket_addrs()?
         .next()
@@ -183,6 +214,12 @@ fn touch_watchdog(host: &str, auth: &Auth) -> Result<(), Box<dyn std::error::Err
     session.handshake()?;
     authenticate(&mut session, auth)?;
 
+    Ok(session)
+}
+
+/// Touch the watchdog file using an existing session. Opens a new channel
+/// (SSH supports multiple channels per session) - no new TCP connection.
+fn touch_watchdog_on_session(session: &Session) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut channel = session.channel_session()?;
     channel.exec(&format!("touch {}", WATCHDOG_FILE))?;
 
@@ -192,3 +229,4 @@ fn touch_watchdog(host: &str, auth: &Auth) -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
