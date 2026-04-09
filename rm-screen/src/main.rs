@@ -8,11 +8,12 @@ use std::process::Child;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use ashpd::desktop::PersistMode;
 use clap::Parser;
 use lamco_pipewire::damage::{DamageConfig, DamageDetector, DetectedRegion};
 use lamco_pipewire::format::PixelFormat;
 use lamco_pipewire::{PipeWireConfig, PipeWireManager, SourceType, StreamInfo, VideoFrame};
-use lamco_portal::PortalManager;
+use lamco_portal::{PortalConfig, PortalManager};
 use log::{error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
@@ -78,7 +79,11 @@ async fn main() -> DynResult<()> {
 
     lamco_pipewire::init();
 
-    let portal = PortalManager::with_default().await?;
+    // Remote-desktop portal sessions must not request persistence (GNOME/KDE reject it).
+    let portal_config = PortalConfig::builder()
+        .persist_mode(PersistMode::DoNot)
+        .build();
+    let portal = PortalManager::new(portal_config).await?;
     let (portal_session, _token) = portal
         .create_session("rm-screen".to_string(), None)
         .await
