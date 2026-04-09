@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(long)]
     pub pen_only: bool,
 
+    /// Expose touch as a direct-mapping touchscreen (for KDE etc.) instead of a touchpad
+    #[arg(long)]
+    pub touchscreen: bool,
+
     /// Grab input exclusively [default: true]
     #[arg(long)]
     pub grab_input: bool,

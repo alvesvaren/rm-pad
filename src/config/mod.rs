@@ -25,6 +25,7 @@ pub struct Config {
     pub touch_device: String,
     pub touch_only: bool,
     pub pen_only: bool,
+    pub touchscreen: bool,
     pub grab_input: bool,
     pub no_palm_rejection: bool,
     pub palm_grace_ms: u64,
@@ -55,6 +56,7 @@ impl Config {
                 .unwrap_or_else(|| file_config.touch_device.unwrap_or(device.touch_device.into())),
             touch_only: cli.touch_only || file_config.touch_only,
             pen_only: cli.pen_only || file_config.pen_only,
+            touchscreen: cli.touchscreen || file_config.touchscreen,
             grab_input: if cli.no_grab_input {
                 false
             } else {
