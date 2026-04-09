@@ -76,11 +76,20 @@ fn log_startup_info(config: &Config) {
         format!("on (grace {}ms)", config.palm_grace_ms)
     };
 
+    let touch_mode = if !config.run_touch() {
+        "off"
+    } else if config.touchscreen {
+        "touchscreen"
+    } else {
+        "touchpad"
+    };
+
     log::info!(
-        "Starting rm-pad: host={}, pen={}, touch={}, palm_rejection={}, grab_input={}, orientation={}",
+        "Starting rm-pad: host={}, pen={}, touch={} ({}), palm_rejection={}, grab_input={}, orientation={}",
         config.host,
         if config.run_pen() { &config.pen_device } else { "off" },
         if config.run_touch() { &config.touch_device } else { "off" },
+        touch_mode,
         palm_info,
         config.grab_input,
         config.orientation
