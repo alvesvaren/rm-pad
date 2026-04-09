@@ -97,7 +97,7 @@ impl Config {
 }
 
 /// Expand a leading `~` or `~/` to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
+pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home);

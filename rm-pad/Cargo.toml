@@ -1,0 +1,12 @@
+[package]
+name = "rm-pad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rm-common = { path = "../rm-common", features = ["ssh"] }
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+evdevil = "0.4.0"
+log = "0.4"
+socket2 = { version = "0.5", features = ["all"] }

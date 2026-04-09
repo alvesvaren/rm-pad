@@ -5,11 +5,11 @@ use evdevil::event::{Abs, Key, KeyEvent, KeyState};
 use evdevil::uinput::{AbsSetup, UinputDevice};
 use evdevil::{AbsInfo, InputProp, Slot};
 
-use crate::config::Config;
-use crate::device::DeviceProfile;
-use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
-use crate::ssh;
+use rm_common::config::Config;
+use rm_common::device::DeviceProfile;
+use rm_common::orientation::Orientation;
+use rm_common::ssh;
 
 use super::event::{
     parse_input_event, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
