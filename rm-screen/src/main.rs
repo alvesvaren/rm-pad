@@ -19,7 +19,9 @@ use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
 use rm_common::grab;
 use rm_common::protocol::UpdateHeader;
-use rm_common::screen_client::{ensure_client_on_device, load_client_binary, spawn_reverse_tunnel};
+use rm_common::screen_client::{
+    ensure_client_on_device, load_client_binary, spawn_reverse_tunnel, validate_client_elf_for_arch,
+};
 use rm_common::ssh;
 use socket2::{Socket, TcpKeepalive};
 
@@ -55,6 +57,10 @@ struct ScreenCli {
     /// Remote port on the tablet side (forwarded to local_port)
     #[arg(long, default_value_t = 9876)]
     remote_port: u16,
+
+    /// Seconds to wait for the tablet client to connect after the SSH tunnel starts
+    #[arg(long, default_value_t = 120)]
+    accept_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -66,12 +72,21 @@ async fn main() -> DynResult<()> {
     let config = load_merged_config(&screen_cli, device);
 
     info!("Connecting to {} for device detection…", config.host);
+    if config.host.contains("10.11.99.") {
+        info!(
+            "USB Ethernet: the tablet is usually 10.11.99.1 and your PC often gets 10.11.99.x — \
+             SSH must target the tablet ({})",
+            config.host
+        );
+    }
     let session = ssh::connect_for_detection(&config)?;
     let device = DeviceProfile::detect_via_ssh(&session)?;
     info!("Device: {}", device.name);
 
-    let _arch = grab::detect_arch(&session)?;
+    let arch = grab::detect_arch(&session)?;
+    info!("Tablet CPU architecture: {} (use a matching cross-compiled rm-client-screen)", arch);
     let client_bytes = load_client_binary(&screen_cli.client_binary)?;
+    validate_client_elf_for_arch(&client_bytes, arch).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     ensure_client_on_device(&session, &client_bytes)?;
     drop(session);
 
@@ -134,6 +149,7 @@ async fn main() -> DynResult<()> {
         "127.0.0.1",
         screen_cli.local_port,
         &remote_cmd,
+        true,
     )?;
 
     let (tx, rx_sock) = mpsc::channel::<std::io::Result<std::net::TcpStream>>();
@@ -142,12 +158,42 @@ async fn main() -> DynResult<()> {
         let _ = tx.send(lis.accept().map(|(s, _)| s));
     });
 
-    let sock = match rx_sock.recv_timeout(Duration::from_secs(30)) {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("TCP accept failed: {e}").into()),
-        Err(_) => {
+    let deadline = std::time::Instant::now() + Duration::from_secs(screen_cli.accept_timeout_secs);
+    let sock = loop {
+        if let Some(status) = tunnel.try_wait()? {
+            return Err(format!(
+                "SSH reverse tunnel exited before the tablet connected (exit status {:?}). \
+                 If stderr above mentions \"Exec format error\" or similar, cross-compile rm-client-screen for {}. \
+                 Also check sshd `PermitOpen` / reverse forwarding settings.",
+                status.code(),
+                arch
+            )
+            .into());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             let _ = tunnel.kill();
-            return Err("timed out waiting for tablet TCP connection (check SSH reverse tunnel)".into());
+            let _ = tunnel.wait();
+            return Err(format!(
+                "Timed out after {}s waiting for the tablet to connect to 127.0.0.1:{}. \
+                 The PC listens here; traffic is tunneled from the tablet via `ssh -R`. \
+                 Your SSH host ({}) should be the tablet (often 10.11.99.1 over USB); your PC is usually 10.11.99.x. \
+                 Pass a cross-compiled --client-binary for {} (not `target/debug/rm-client-screen` built for the laptop).",
+                screen_cli.accept_timeout_secs,
+                screen_cli.local_port,
+                config.host,
+                arch
+            )
+            .into());
+        }
+        let step = Duration::from_secs(1).min(remaining);
+        match rx_sock.recv_timeout(step) {
+            Ok(Ok(s)) => break s,
+            Ok(Err(e)) => return Err(format!("TCP accept failed: {e}").into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("TCP accept thread ended unexpectedly".into());
+            }
         }
     };
     configure_tcp_stream(&sock)?;
