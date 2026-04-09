@@ -2,24 +2,26 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ashpd::desktop::PersistMode;
 use clap::Parser;
 use lamco_pipewire::damage::{DamageConfig, DamageDetector, DetectedRegion};
 use lamco_pipewire::format::PixelFormat;
-use lamco_pipewire::{PipeWireConfig, PipeWireManager, SourceType, StreamInfo, VideoFrame};
+use lamco_pipewire::{
+    PipeWireConfig, PipeWireThreadCommand, PipeWireThreadManager, SourceType, StreamConfig, StreamInfo, VideoFrame,
+};
 use lamco_portal::{PortalConfig, PortalManager};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
 use rm_common::grab;
-use rm_common::protocol::UpdateHeader;
-use rm_common::screen_client::{ensure_client_on_device, load_client_binary, spawn_reverse_tunnel};
+use rm_common::protocol::{UpdateHeader, HEADER_SIZE};
+use rm_common::screen_client::{self, ensure_client_on_device, load_client_binary, spawn_reverse_tunnel};
 use rm_common::ssh;
 use socket2::{Socket, TcpKeepalive};
 
@@ -65,6 +67,11 @@ async fn main() -> DynResult<()> {
     let device = DeviceProfile::current();
     let config = load_merged_config(&screen_cli, device);
 
+    info!(
+        "rm-screen: listening for tablet on 127.0.0.1:{} (SSH reverse → {}:{} on device)",
+        screen_cli.local_port, config.host, screen_cli.remote_port
+    );
+
     info!("Connecting to {} for device detection…", config.host);
     let session = ssh::connect_for_detection(&config)?;
     let device = DeviceProfile::detect_via_ssh(&session)?;
@@ -73,9 +80,28 @@ async fn main() -> DynResult<()> {
     let _arch = grab::detect_arch(&session)?;
     let client_bytes = load_client_binary(&screen_cli.client_binary)?;
     ensure_client_on_device(&session, &client_bytes)?;
+    let fb_shim = screen_client::detect_fb_shim(&session)?;
+    let appload_launch = matches!(&fb_shim, Some(screen_client::FbShim::QtfbShim(_)));
+    if appload_launch {
+        info!("qtfb-shim detected — client will be launched from AppLoad on the tablet");
+    }
+    match &fb_shim {
+        None if device.name == "reMarkable 2" => {
+            warn!(
+                "reMarkable 2 detected but no framebuffer shim found — \
+                 framebuffer updates will likely be invisible. \
+                 Install Vellum+AppLoad (qtfb-shim) or rm2fb on the device."
+            );
+        }
+        _ => {}
+    }
     drop(session);
 
     let listener = TcpListener::bind(("127.0.0.1", screen_cli.local_port))?;
+    info!(
+        "local TCP listener ready on {} (waiting for tunnel + rm-client-screen before capture starts)",
+        listener.local_addr()?
+    );
 
     lamco_pipewire::init();
 
@@ -88,6 +114,7 @@ async fn main() -> DynResult<()> {
         .create_session("rm-screen".to_string(), None)
         .await
         .map_err(|e| format!("portal session failed: {e}"))?;
+    info!("desktop portal screencast session active (PipeWire fd ready)");
 
     let pw_fd = unsafe { OwnedFd::from_raw_fd(portal_session.pipewire_fd()) };
 
@@ -97,9 +124,6 @@ async fn main() -> DynResult<()> {
         .enable_damage_tracking(true)
         .frame_buffer_size(8)
         .build();
-
-    let mut pw = PipeWireManager::new(pw_config)?;
-    pw.connect(pw_fd).await?;
 
     let streams = portal_session.streams();
     if streams.is_empty() {
@@ -116,25 +140,121 @@ async fn main() -> DynResult<()> {
             lamco_portal::SourceType::Virtual => SourceType::Virtual,
         },
     };
-
-    let handle = pw.create_stream(&stream_info).await?;
-    let mut rx = pw
-        .frame_receiver(handle.id)
-        .await
-        .ok_or("frame receiver already taken")?;
-
-    let remote_cmd = format!(
-        "exec {} 127.0.0.1 {}",
-        rm_common::screen_client::REMOTE_CLIENT_PATH,
-        screen_cli.remote_port
+    info!(
+        "capture source: {:?} node_id={} size={}×{} at {:?} (portal reports {} stream(s))",
+        stream_info.source_type,
+        stream_info.node_id,
+        stream_info.size.0,
+        stream_info.size.1,
+        stream_info.position,
+        streams.len(),
     );
-    let mut tunnel: Child = spawn_reverse_tunnel(
-        &config,
-        screen_cli.remote_port,
-        "127.0.0.1",
-        screen_cli.local_port,
-        &remote_cmd,
-    )?;
+    if streams.len() > 1 {
+        debug!(
+            "additional portal streams ignored (using first only): {:?}",
+            streams
+                .iter()
+                .skip(1)
+                .map(|s| (s.node_id, s.size))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // PipeWireManager::frame_receiver is broken in lamco-pipewire 0.4.2 (sender is dropped).
+    // Use PipeWireThreadManager, which delivers frames on the working std mpsc channel.
+    let raw_fd = pw_fd.into_raw_fd();
+    let mut stream_config = StreamConfig::new(format!("{}-0", pw_config.stream_name_prefix))
+        .with_resolution(stream_info.size.0, stream_info.size.1)
+        .with_dmabuf(pw_config.use_dmabuf)
+        .with_buffer_count(pw_config.buffer_count);
+    stream_config.preferred_format = pw_config.preferred_format;
+
+    let pw_thread = PipeWireThreadManager::new(raw_fd).map_err(|e| e.to_string())?;
+    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+    pw_thread
+        .send_command(PipeWireThreadCommand::CreateStream {
+            stream_id: 0,
+            node_id: stream_info.node_id,
+            config: stream_config,
+            response_tx,
+        })
+        .map_err(|e| e.to_string())?;
+    response_rx
+        .recv()
+        .map_err(|_| "PipeWire CreateStream: response channel closed".to_string())?
+        .map_err(|e| e.to_string())?;
+    info!("PipeWire stream connected (waiting for tablet TCP before consuming frames)");
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<VideoFrame>(8);
+    let bridge = std::thread::spawn(move || {
+        let mut pw_thread = pw_thread;
+        let mut bridged: u64 = 0;
+        loop {
+            if let Some(frame) = pw_thread.recv_frame_timeout(Duration::from_millis(100)) {
+                bridged += 1;
+                if bridged == 1 {
+                    debug!(
+                        "frame bridge: first PipeWire frame {}×{} (format {:?})",
+                        frame.width, frame.height, frame.format
+                    );
+                } else if bridged % 600 == 0 {
+                    debug!("frame bridge: forwarded {} frames from PipeWire thread", bridged);
+                }
+                if frame_tx.blocking_send(frame).is_err() {
+                    debug!(
+                        "frame bridge: stopping after {} PipeWire frames (Tokio receiver dropped)",
+                        bridged
+                    );
+                    break;
+                }
+            }
+        }
+        debug!("frame bridge: shutting down PipeWire thread");
+        let _ = pw_thread.shutdown();
+    });
+
+    let mut tunnel: Child = if appload_launch {
+        // qtfb-shim: the app must be launched from AppLoad for display compositing.
+        // Write the manifest (with connection args) and start a tunnel-only SSH session.
+        let session = ssh::connect_for_detection(&config)?;
+        screen_client::ensure_appload_manifest(
+            &session,
+            fb_shim.as_ref().expect("appload_launch implies shim"),
+            screen_cli.remote_port,
+            stream_info.size.0,
+            stream_info.size.1,
+        )?;
+        drop(session);
+        info!(
+            "AppLoad manifest updated (port={}, capture={}×{}). \
+             Launch \"Screen Mirror\" from AppLoad on the tablet.",
+            screen_cli.remote_port, stream_info.size.0, stream_info.size.1
+        );
+        screen_client::spawn_tunnel_only(
+            &config,
+            screen_cli.remote_port,
+            "127.0.0.1",
+            screen_cli.local_port,
+        )?
+    } else {
+        let remote_cmd = screen_client::remote_screen_command(
+            screen_cli.remote_port,
+            stream_info.size.0,
+            stream_info.size.1,
+            fb_shim.as_ref(),
+        );
+        info!(
+            "remote client command: {} (capture {}×{})",
+            remote_cmd, stream_info.size.0, stream_info.size.1
+        );
+        spawn_reverse_tunnel(
+            &config,
+            screen_cli.remote_port,
+            "127.0.0.1",
+            screen_cli.local_port,
+            &remote_cmd,
+        )?
+    };
 
     let (tx, rx_sock) = mpsc::channel::<std::io::Result<std::net::TcpStream>>();
     let lis = listener;
@@ -142,29 +262,78 @@ async fn main() -> DynResult<()> {
         let _ = tx.send(lis.accept().map(|(s, _)| s));
     });
 
-    let sock = match rx_sock.recv_timeout(Duration::from_secs(30)) {
+    let timeout = if appload_launch {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    };
+    if appload_launch {
+        info!("Waiting for you to launch \"Screen Mirror\" from AppLoad on the tablet (timeout {}s)…", timeout.as_secs());
+    } else {
+        info!("Waiting for tablet to connect via reverse SSH (timeout {}s)…", timeout.as_secs());
+    }
+    let sock = match rx_sock.recv_timeout(timeout) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("TCP accept failed: {e}").into()),
         Err(_) => {
             let _ = tunnel.kill();
+            if appload_launch {
+                return Err("timed out — launch \"Screen Mirror\" from AppLoad on the tablet while rm-screen is running".into());
+            }
             return Err("timed out waiting for tablet TCP connection (check SSH reverse tunnel)".into());
         }
     };
+    match (sock.peer_addr(), sock.local_addr()) {
+        (Ok(peer), Ok(local)) => info!("tablet TCP tunnel up (peer {peer}, local {local}); starting screen encode"),
+        _ => info!("tablet TCP tunnel up; starting screen encode"),
+    }
     configure_tcp_stream(&sock)?;
 
     let mut sock = sock;
     let mut damage = DamageDetector::new(DamageConfig::low_bandwidth());
 
-    while let Some(frame) = rx.recv().await {
-        if let Err(e) = process_frame(&mut sock, &mut damage, &frame) {
-            error!("stream error: {e}");
-            break;
+    let mut frame_count: u64 = 0;
+    let mut last_progress = Instant::now();
+    loop {
+        match frame_rx.recv().await {
+            Some(frame) => {
+                frame_count += 1;
+                if frame_count <= 5 {
+                    info!(
+                        "frame #{} {}×{} format={:?} compositor_damage_rects={}",
+                        frame_count,
+                        frame.width,
+                        frame.height,
+                        frame.format,
+                        frame.damage_regions.len(),
+                    );
+                } else if last_progress.elapsed() >= Duration::from_secs(5) {
+                    info!(
+                        "streaming… {} frames processed (latest {}×{})",
+                        frame_count, frame.width, frame.height
+                    );
+                    last_progress = Instant::now();
+                }
+                if let Err(e) = process_frame(&mut sock, &mut damage, &frame) {
+                    error!("stream error: {e}");
+                    info!("stopped after {frame_count} frames (write to tablet failed)");
+                    break;
+                }
+            }
+            None => {
+                info!("frame pipeline ended after {frame_count} frames (sender closed — capture or bridge stopped)");
+                break;
+            }
         }
     }
+    drop(frame_rx);
+    if let Err(e) = bridge.join() {
+        error!("frame bridge thread join: {e:?}");
+    }
 
+    info!("rm-screen session teardown…");
     let _ = tunnel.kill();
     let _ = tunnel.wait();
-    pw.shutdown().await.ok();
     lamco_pipewire::deinit();
     portal.cleanup().await.ok();
 
@@ -217,6 +386,8 @@ fn process_frame(
     let h = frame.height;
 
     let regions = regions_for_frame(frame, damage, data, w, h);
+    let mut regions_sent: u32 = 0;
+    let mut wire_bytes: u64 = 0;
 
     for r in regions {
         let (x, y, rw, rh) = clip_region(r, w, h);
@@ -237,6 +408,17 @@ fn process_frame(
         sock.write_all(&header.to_bytes())?;
         sock.write_all(&compressed)?;
         sock.flush()?;
+        regions_sent += 1;
+        wire_bytes += HEADER_SIZE as u64 + compressed.len() as u64;
+    }
+
+    if regions_sent > 0 {
+        debug!(
+            "encoded frame {}×{} → {regions_sent} region update(s), {wire_bytes} B on wire (LZ4 payloads + headers)",
+            w, h
+        );
+    } else {
+        debug!("frame {}×{}: no regions sent (fully skipped or empty damage)", w, h);
     }
 
     Ok(())

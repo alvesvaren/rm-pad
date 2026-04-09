@@ -91,15 +91,12 @@ pub fn ssh_base_args(config: &Config) -> Result<Vec<String>, Box<dyn std::error:
     }
 }
 
-/// Spawn `ssh -R remote_port:local_host:local_port ... exec remote_cmd`.
-/// Keep the child alive for the lifetime of the screen session; kill it on shutdown.
-pub fn spawn_reverse_tunnel(
+fn ssh_tunnel_args(
     config: &Config,
     remote_forward_port: u16,
     local_host: &str,
     local_port: u16,
-    remote_cmd: &str,
-) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut args = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -116,6 +113,19 @@ pub fn spawn_reverse_tunnel(
     args.push("-R".into());
     args.push(format!("{}:{}:{}", remote_forward_port, local_host, local_port));
     args.push(format!("root@{}", config.host));
+    Ok(args)
+}
+
+/// Spawn `ssh -R remote_port:local_host:local_port ... exec remote_cmd`.
+/// Keep the child alive for the lifetime of the screen session; kill it on shutdown.
+pub fn spawn_reverse_tunnel(
+    config: &Config,
+    remote_forward_port: u16,
+    local_host: &str,
+    local_port: u16,
+    remote_cmd: &str,
+) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
+    let mut args = ssh_tunnel_args(config, remote_forward_port, local_host, local_port)?;
     args.push(remote_cmd.into());
 
     log::info!("Starting reverse SSH tunnel: ssh {}", args.join(" "));
@@ -128,6 +138,152 @@ pub fn spawn_reverse_tunnel(
         .spawn()?;
 
     Ok(child)
+}
+
+/// Spawn an SSH tunnel (`-R` + `-N`) without running a remote command.
+/// Used when the tablet-side client is launched from AppLoad instead of SSH.
+pub fn spawn_tunnel_only(
+    config: &Config,
+    remote_forward_port: u16,
+    local_host: &str,
+    local_port: u16,
+) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
+    let mut args = ssh_tunnel_args(config, remote_forward_port, local_host, local_port)?;
+    args.push("-N".into());
+
+    log::info!("Starting SSH tunnel (no remote command): ssh {}", args.join(" "));
+
+    let child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    Ok(child)
+}
+
+/// Framebuffer shim needed on the reMarkable 2, where the raw EPDC is not
+/// directly usable by third-party apps.  Two mechanisms exist in the wild:
+///
+/// 1. **qtfb-shim** (AppLoad / Vellum) — the modern path.  Needs
+///    `LD_PRELOAD` plus `QTFB_SHIM_MODEL` and `QTFB_SHIM_INPUT_MODE` env vars.
+/// 2. **librm2fb_client.so** (Toltec / rm2fb) — the legacy path.  Needs
+///    `LD_PRELOAD` only.
+#[derive(Debug, Clone)]
+pub enum FbShim {
+    /// AppLoad qtfb-shim at the given path (e.g. `/home/root/shims/qtfb-shim.so`).
+    QtfbShim(String),
+    /// Legacy rm2fb client library (e.g. `/opt/lib/librm2fb_client.so`).
+    Rm2fb(String),
+}
+
+const QTFB_SHIM_PATH: &str = "/home/root/shims/qtfb-shim.so";
+const RM2FB_CLIENT_LIB: &str = "/opt/lib/librm2fb_client.so";
+
+fn remote_file_exists(session: &Session, path: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut channel = session.channel_session()?;
+    channel.exec(&format!("test -f {path} && echo found"))?;
+    let mut output = String::new();
+    channel.read_to_string(&mut output)?;
+    channel.close()?;
+    channel.wait_close()?;
+    Ok(output.trim() == "found")
+}
+
+/// Probe the device for a usable framebuffer shim.
+/// Checks for the AppLoad qtfb-shim first, then falls back to the legacy
+/// rm2fb client library.
+pub fn detect_fb_shim(session: &Session) -> Result<Option<FbShim>, Box<dyn std::error::Error + Send + Sync>> {
+    if remote_file_exists(session, QTFB_SHIM_PATH)? {
+        log::info!("AppLoad qtfb-shim detected at {}", QTFB_SHIM_PATH);
+        return Ok(Some(FbShim::QtfbShim(QTFB_SHIM_PATH.to_string())));
+    }
+    if remote_file_exists(session, RM2FB_CLIENT_LIB)? {
+        log::info!("rm2fb client library detected at {}", RM2FB_CLIENT_LIB);
+        return Ok(Some(FbShim::Rm2fb(RM2FB_CLIENT_LIB.to_string())));
+    }
+    log::debug!("no framebuffer shim found (checked {} and {})", QTFB_SHIM_PATH, RM2FB_CLIENT_LIB);
+    Ok(None)
+}
+
+/// Build the `exec …` remote command for the screen client, setting the
+/// appropriate environment variables for the detected framebuffer shim.
+pub fn remote_screen_command(
+    remote_port: u16,
+    src_w: u32,
+    src_h: u32,
+    shim: Option<&FbShim>,
+) -> String {
+    let env_prefix = match shim {
+        Some(FbShim::QtfbShim(path)) => format!(
+            "LD_PRELOAD={path} QTFB_SHIM_MODEL=0 QTFB_SHIM_INPUT_MODE=NATIVE LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB=1 "
+        ),
+        Some(FbShim::Rm2fb(path)) => format!("LD_PRELOAD={path} "),
+        None => String::new(),
+    };
+    format!(
+        "RUST_LOG=info {env_prefix}exec {} 127.0.0.1 {} {} {} 2>/tmp/rm-client-screen.log",
+        REMOTE_CLIENT_PATH, remote_port, src_w, src_h,
+    )
+}
+
+const APPLOAD_APP_DIR: &str = "/home/root/xovi/exthome/appload/rm-screen";
+
+/// Install (or update) an AppLoad `external.manifest.json` so the screen
+/// client appears in the AppLoad launcher and the user can close it from
+/// the UI with the standard top-swipe gesture.
+///
+/// The manifest includes connection args (port, capture dimensions) so the
+/// client knows where to connect when launched from AppLoad.
+pub fn ensure_appload_manifest(
+    session: &Session,
+    shim: &FbShim,
+    remote_port: u16,
+    src_w: u32,
+    src_h: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (preload, extra_env) = match shim {
+        FbShim::QtfbShim(path) => (
+            path.as_str(),
+            r#",
+    "QTFB_SHIM_MODEL": "0",
+    "QTFB_SHIM_INPUT_MODE": "NATIVE",
+    "LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB": "1""#,
+        ),
+        FbShim::Rm2fb(path) => (path.as_str(), ""),
+    };
+
+    let manifest = format!(
+        r#"{{
+  "name": "Screen Mirror",
+  "application": "{}",
+  "args": ["127.0.0.1", "{}", "{}", "{}"],
+  "environment": {{
+    "LD_PRELOAD": "{}",
+    "RUST_LOG": "info"{}
+  }},
+  "qtfb": true
+}}"#,
+        REMOTE_CLIENT_PATH, remote_port, src_w, src_h, preload, extra_env,
+    );
+
+    let cmd = format!(
+        "mkdir -p {dir} && cat > {dir}/external.manifest.json",
+        dir = APPLOAD_APP_DIR,
+    );
+    let mut channel = session.channel_session()?;
+    channel.exec(&cmd)?;
+    channel.write_all(manifest.as_bytes())?;
+    channel.send_eof()?;
+    channel.wait_eof()?;
+    channel.close()?;
+    channel.wait_close()?;
+    if channel.exit_status()? != 0 {
+        return Err("failed to write AppLoad manifest".into());
+    }
+    log::info!("AppLoad manifest installed at {}/external.manifest.json", APPLOAD_APP_DIR);
+    Ok(())
 }
 
 /// Load client binary for the given tablet architecture from disk.
