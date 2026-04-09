@@ -1,9 +1,9 @@
 use std::io::Read;
 
-use crate::config::Config;
-use crate::device::DeviceProfile;
 use crate::input::parse_input_event;
-use crate::ssh;
+use rm_common::config::Config;
+use rm_common::device::DeviceProfile;
+use rm_common::ssh;
 
 pub fn run_touch(
     config: &Config,

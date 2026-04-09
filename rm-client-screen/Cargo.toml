@@ -1,0 +1,12 @@
+[package]
+name = "rm-client-screen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rm-common = { path = "../rm-common", default-features = false }
+env_logger = "0.11"
+libremarkable = { version = "0.7.0", default-features = false, features = ["framebuffer"] }
+log = "0.4"
+lz4_flex = "0.11"
+libc = "0.2"

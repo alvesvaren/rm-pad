@@ -16,13 +16,14 @@ build() {
   # Set CARGO_TARGET_DIR to avoid picking up parent Cargo.toml
   export CARGO_TARGET_DIR="$srcdir/target"
   cd "$srcdir/rm-pad"
-  cargo build --release --locked
+  cargo build -p rm-pad --release --locked
 }
 
 package() {
   cd "$srcdir/rm-pad"
 
   install -Dm755 "$srcdir/target/release/rm-pad" "$pkgdir/usr/bin/rm-pad"
+  install -Dm755 "$srcdir/target/release/rm-screen" "$pkgdir/usr/bin/rm-screen"
 
   install -Dm644 data/50-uinput.rules "$pkgdir/usr/lib/udev/rules.d/50-uinput.rules"
 

@@ -1,15 +1,3 @@
-[package]
-name = "rm-pad"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-clap = { version = "4", features = ["derive", "env"] }
-env_logger = "0.11"
-evdevil = "0.4.0"
-log = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-sha2 = "0.10"
-socket2 = { version = "0.5", features = ["all"] }
-ssh2 = "0.9.5"
-toml = "0.8"
+[workspace]
+resolver = "2"
+members = ["rm-common", "rm-pad", "rm-screen", "rm-client-screen"]

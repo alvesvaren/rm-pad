@@ -5,11 +5,11 @@ use evdevil::event::{Abs, InputEvent, Key};
 use evdevil::uinput::{AbsSetup, UinputDevice};
 use evdevil::{AbsInfo, Bus, InputId, InputProp};
 
-use crate::config::Config;
-use crate::device::DeviceProfile;
-use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
-use crate::ssh;
+use rm_common::config::Config;
+use rm_common::device::DeviceProfile;
+use rm_common::orientation::Orientation;
+use rm_common::ssh;
 
 use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, SYN_REPORT};
 

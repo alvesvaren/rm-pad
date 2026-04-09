@@ -1,0 +1,16 @@
+[package]
+name = "rm-screen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ashpd = { version = "0.13.9", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+rm-common = { path = "../rm-common", features = ["ssh"] }
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+lamco-pipewire = { version = "0.4.2", default-features = false, features = ["damage"] }
+lamco-portal = "0.4.0"
+log = "0.4"
+lz4_flex = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
