@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ashpd::desktop::PersistMode;
@@ -20,14 +21,37 @@ use log::{debug, error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
 use rm_common::grab;
-use rm_common::protocol::UpdateHeader;
-use rm_common::screen_client::{self, ensure_client_on_device, load_client_binary, spawn_reverse_tunnel};
+use rm_common::protocol::{UpdateHeader, UPDATE_COORDS_FRAMEBUFFER};
+use rm_common::screen_client::{
+    self, ensure_client_on_device, load_client_binary, spawn_remote_exec, spawn_reverse_tunnel,
+};
 use rm_common::ssh;
 use socket2::{Socket, TcpKeepalive};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const WAVEFORM_DU: u8 = 1;
+/// PipeWire → main queue depth. Larger values let `recv_latest_drained` pick a fresher frame while
+/// the main task is encoding or waiting for ACK (capacity 2 was stalling the bridge often).
+const FRAME_CHANNEL_CAP: usize = 32;
+
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Block on first `recv`, drain `try_recv`, return freshest frame.
+async fn recv_latest_drained(
+    rx: &mut tokio::sync::mpsc::Receiver<VideoFrame>,
+) -> Option<(VideoFrame, u64, f64)> {
+    let tw = Instant::now();
+    let first = rx.recv().await?;
+    let mut latest = first;
+    let mut skipped = 0u64;
+    while let Ok(newer) = rx.try_recv() {
+        latest = newer;
+        skipped += 1;
+    }
+    Some((latest, skipped, elapsed_ms(tw)))
+}
 
 #[derive(Parser)]
 #[command(name = "rm-screen")]
@@ -57,6 +81,31 @@ struct ScreenCli {
     /// Remote port on the tablet side (forwarded to local_port)
     #[arg(long, default_value_t = 9876)]
     remote_port: u16,
+
+    /// Tablet framebuffer width in pixels (default: from detected device model).
+    #[arg(long)]
+    tablet_fb_w: Option<u32>,
+
+    /// Tablet framebuffer height in pixels (default: from detected device model).
+    #[arg(long)]
+    tablet_fb_h: Option<u32>,
+
+    /// Skip the SSH reverse tunnel and listen for direct TCP (e.g. USB Ethernet).
+    /// Requires `--advertise-host` (PC address reachable from the tablet).
+    #[arg(long)]
+    direct_tcp: bool,
+
+    /// PC hostname or IP placed in the AppLoad manifest / remote client command.
+    #[arg(long)]
+    advertise_host: Option<String>,
+
+    /// Address for `TcpListener` (use `0.0.0.0` to accept USB/LAN; may need a firewall rule).
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_addr: String,
+
+    /// Log every main-loop iteration (including waits with no dirty region). Very noisy.
+    #[arg(long)]
+    stream_trace: bool,
 }
 
 #[tokio::main]
@@ -90,13 +139,28 @@ async fn main() -> DynResult<()> {
         }
         _ => {}
     }
+    let (fb_w, fb_h) = (
+        screen_cli.tablet_fb_w.unwrap_or_else(|| device.framebuffer_size().0),
+        screen_cli.tablet_fb_h.unwrap_or_else(|| device.framebuffer_size().1),
+    );
     drop(session);
 
-    let listener = TcpListener::bind(("127.0.0.1", screen_cli.local_port))?;
+    let bind_sa: std::net::SocketAddr = format!("{}:{}", screen_cli.bind_addr, screen_cli.local_port)
+        .parse()
+        .map_err(|e| format!("invalid bind address {}:{} — {e}", screen_cli.bind_addr, screen_cli.local_port))?;
+    let listener = TcpListener::bind(bind_sa)?;
     info!(
-        "TCP listener ready on {} (waiting for client connection)",
-        listener.local_addr()?
+        "TCP listener on {} (tablet framebuffer {}×{} for host-side scaling)",
+        listener.local_addr()?,
+        fb_w,
+        fb_h
     );
+    if screen_cli.direct_tcp && screen_cli.bind_addr != "127.0.0.1" {
+        info!(
+            "direct TCP: ensure the host firewall allows inbound TCP {} from the tablet",
+            screen_cli.local_port
+        );
+    }
 
     lamco_pipewire::init();
 
@@ -180,7 +244,7 @@ async fn main() -> DynResult<()> {
         .map_err(|e| e.to_string())?;
     info!("PipeWire stream connected (waiting for tablet TCP before consuming frames)");
 
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<VideoFrame>(2);
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<VideoFrame>(FRAME_CHANNEL_CAP);
     let bridge = std::thread::spawn(move || {
         let mut pw_thread = pw_thread;
         let mut bridged: u64 = 0;
@@ -195,6 +259,7 @@ async fn main() -> DynResult<()> {
                 } else if bridged % 600 == 0 {
                     debug!("frame bridge: forwarded {} frames from PipeWire thread", bridged);
                 }
+                let tw_push = Instant::now();
                 if frame_tx.blocking_send(frame).is_err() {
                     debug!(
                         "frame bridge: stopping after {} PipeWire frames (Tokio receiver dropped)",
@@ -202,13 +267,58 @@ async fn main() -> DynResult<()> {
                     );
                     break;
                 }
+                let push_ms = elapsed_ms(tw_push);
+                if push_ms > 250.0 {
+                    warn!(
+                        "frame bridge: PipeWire→tokio mpsc blocked {:.1}ms (capacity {} — main loop slow vs PipeWire)",
+                        push_ms, FRAME_CHANNEL_CAP
+                    );
+                }
             }
         }
         debug!("frame bridge: shutting down PipeWire thread");
         let _ = pw_thread.shutdown();
     });
 
-    let mut tunnel: Child = if appload_launch {
+    if screen_cli.direct_tcp && screen_cli.advertise_host.is_none() {
+        return Err(
+            "--advertise-host is required with --direct-tcp (tablet must reach your PC; try the USB NIC IP)"
+                .into(),
+        );
+    }
+
+    let tunnel: Option<Child> = if screen_cli.direct_tcp {
+        let pc_host = screen_cli.advertise_host.as_deref().expect("checked above");
+        let pc_port = screen_cli.local_port;
+        if appload_launch {
+            let session = ssh::connect_for_detection(&config)?;
+            screen_client::ensure_appload_manifest(
+                &session,
+                fb_shim.as_ref().expect("appload_launch implies shim"),
+                pc_host,
+                pc_port,
+                stream_info.size.0,
+                stream_info.size.1,
+            )?;
+            drop(session);
+            info!(
+                "AppLoad manifest: connect to {}:{} (direct TCP, capture {}×{}). \
+                 Launch \"Screen Mirror\" on the tablet.",
+                pc_host, pc_port, stream_info.size.0, stream_info.size.1
+            );
+            None
+        } else {
+            let remote_cmd = screen_client::remote_screen_command(
+                pc_host,
+                pc_port,
+                stream_info.size.0,
+                stream_info.size.1,
+                fb_shim.as_ref(),
+            );
+            info!("remote client command: {}", remote_cmd);
+            Some(spawn_remote_exec(&config, &remote_cmd)?)
+        }
+    } else if appload_launch {
         let session = ssh::connect_for_detection(&config)?;
         screen_client::ensure_appload_manifest(
             &session,
@@ -224,14 +334,15 @@ async fn main() -> DynResult<()> {
              Launch \"Screen Mirror\" from AppLoad on the tablet.",
             screen_cli.remote_port, stream_info.size.0, stream_info.size.1
         );
-        screen_client::spawn_tunnel_only(
+        Some(screen_client::spawn_tunnel_only(
             &config,
             screen_cli.remote_port,
             "127.0.0.1",
             screen_cli.local_port,
-        )?
+        )?)
     } else {
         let remote_cmd = screen_client::remote_screen_command(
+            "127.0.0.1",
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
@@ -241,13 +352,13 @@ async fn main() -> DynResult<()> {
             "remote client command: {} (capture {}×{})",
             remote_cmd, stream_info.size.0, stream_info.size.1
         );
-        spawn_reverse_tunnel(
+        Some(spawn_reverse_tunnel(
             &config,
             screen_cli.remote_port,
             "127.0.0.1",
             screen_cli.local_port,
             &remote_cmd,
-        )?
+        )?)
     };
 
     let (tx, rx_sock) = mpsc::channel::<std::io::Result<std::net::TcpStream>>();
@@ -263,6 +374,13 @@ async fn main() -> DynResult<()> {
     };
     if appload_launch {
         info!("Waiting for you to launch \"Screen Mirror\" from AppLoad on the tablet (timeout {}s)…", timeout.as_secs());
+    } else if screen_cli.direct_tcp {
+        info!(
+            "Waiting for tablet TCP to {}:{} (timeout {}s)…",
+            screen_cli.bind_addr,
+            screen_cli.local_port,
+            timeout.as_secs()
+        );
     } else {
         info!("Waiting for tablet to connect via reverse SSH (timeout {}s)…", timeout.as_secs());
     }
@@ -270,11 +388,13 @@ async fn main() -> DynResult<()> {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("TCP accept failed: {e}").into()),
         Err(_) => {
-            let _ = tunnel.kill();
+            if let Some(mut t) = tunnel {
+                let _ = t.kill();
+            }
             if appload_launch {
                 return Err("timed out — launch \"Screen Mirror\" from AppLoad on the tablet while rm-screen is running".into());
             }
-            return Err("timed out waiting for tablet TCP connection (check SSH reverse tunnel)".into());
+            return Err("timed out waiting for tablet TCP connection (check network / SSH tunnel)".into());
         }
     };
     match (sock.peer_addr(), sock.local_addr()) {
@@ -282,30 +402,53 @@ async fn main() -> DynResult<()> {
         _ => info!("tablet connected; starting screen encode"),
     }
     configure_tcp_stream(&sock)?;
+    let sock_read = Arc::new(Mutex::new(
+        sock.try_clone()
+            .map_err(|e| format!("TCP try_clone for ACK reads: {e}"))?,
+    ));
 
     let mut sock = sock;
     let mut damage = DamageDetector::new(DamageConfig::low_bandwidth());
+    // Portal `stream_info.size` can disagree with actual PipeWire `VideoFrame` dimensions; scaling
+    // and `gray_at_fb_pixel` must use the frame buffer size we read from.
+    let mut lb = Letterbox::new(stream_info.size.0, stream_info.size.1, fb_w, fb_h);
+    info!(
+        "letterbox (portal): scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+        lb.scale,
+        lb.off_x,
+        lb.off_y,
+        lb.dst_fit_w,
+        lb.dst_fit_h,
+        stream_info.size.0,
+        stream_info.size.1
+    );
+    info!(
+        "rm-screen stream log: one INFO line per update (ACK runs in parallel with fetching the next frame). \
+         Use --stream-trace for iterations with no dirty region."
+    );
 
     let mut frame_count: u64 = 0;
     let mut frames_dropped: u64 = 0;
     let mut last_progress = Instant::now();
-    loop {
-        let frame = match frame_rx.recv().await {
-            Some(f) => f,
+    let mut stream_seq: u64 = 0;
+
+    let (mut latest, mut prev_channel_skipped, mut prev_recv_ms) =
+        match recv_latest_drained(&mut frame_rx).await {
+            Some(x) => x,
             None => {
-                info!("frame pipeline ended after {frame_count} frames sent, {frames_dropped} dropped (sender closed)");
-                break;
+                info!("frame pipeline ended before first frame (sender closed)");
+                drop(frame_rx);
+                let _ = bridge.join();
+                return Ok(());
             }
         };
+    frames_dropped += prev_channel_skipped;
 
-        // Drain the channel: keep only the freshest frame.
-        let mut latest = frame;
-        let mut skipped: u64 = 0;
-        while let Ok(newer) = frame_rx.try_recv() {
-            latest = newer;
-            skipped += 1;
-        }
-        frames_dropped += skipped;
+    loop {
+        let tw_cycle = Instant::now();
+        let skipped = prev_channel_skipped;
+        let ms_recv_wait = prev_recv_ms;
+        let ms_drain_spin = 0.0_f64;
 
         frame_count += 1;
         if frame_count <= 3 {
@@ -325,30 +468,162 @@ async fn main() -> DynResult<()> {
             last_progress = Instant::now();
         }
 
-        let sent = match process_frame(&mut sock, &mut damage, &latest) {
-            Ok(sent) => sent,
+        if latest.width != lb.src_w || latest.height != lb.src_h {
+            warn!(
+                "capture buffer differs from letterbox source: PipeWire {}×{} vs letterbox {}×{} — \
+                 recomputing letterbox (portal stream size was {}×{})",
+                latest.width,
+                latest.height,
+                lb.src_w,
+                lb.src_h,
+                stream_info.size.0,
+                stream_info.size.1
+            );
+            lb = Letterbox::new(latest.width, latest.height, fb_w, fb_h);
+            damage.invalidate();
+            info!(
+                "letterbox (actual frames): scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+                lb.scale,
+                lb.off_x,
+                lb.off_y,
+                lb.dst_fit_w,
+                lb.dst_fit_h,
+                lb.src_w,
+                lb.src_h
+            );
+        }
+
+        let encode_out = match encode_update(&mut damage, &latest, &lb) {
+            Ok(v) => v,
             Err(e) => {
                 error!("stream error: {e}");
-                info!("stopped after {frame_count} frames sent (write to tablet failed)");
+                info!("stopped after {frame_count} frames sent (encode failed)");
                 break;
             }
         };
 
-        if sent {
-            // Wait for tablet ACK before sending the next frame.  This keeps
-            // exactly one update in the pipeline (no SSH/TCP buffer bloat).
-            // While blocked here, PipeWire frames accumulate in the channel;
-            // drain-to-latest on the next iteration picks the freshest.
-            let mut ack = [0u8; 1];
-            if let Err(e) = sock.read_exact(&mut ack) {
-                error!("ACK read failed: {e}");
-                info!("stopped after {frame_count} frames sent (tablet gone?)");
+        if let Some((wire_buf, mut stats)) = encode_out {
+            stream_seq += 1;
+
+            let tw_write = Instant::now();
+            if let Err(e) = sock.write_all(&wire_buf) {
+                error!("TCP write failed: {e}");
+                info!("stopped after {frame_count} frames sent");
                 break;
             }
+            if let Err(e) = sock.flush() {
+                error!("TCP flush failed: {e}");
+                break;
+            }
+            stats.ms_write = elapsed_ms(tw_write);
+
+            let sock_r = sock_read.clone();
+            let ack_task = tokio::task::spawn_blocking(move || {
+                let mut guard = sock_r
+                    .lock()
+                    .map_err(|e| format!("ACK lock poisoned: {e}"))?;
+                let t_ack = Instant::now();
+                let mut ack = [0u8; 1];
+                guard
+                    .read_exact(&mut ack)
+                    .map_err(|e| format!("ACK read: {e}"))?;
+                Ok::<_, String>((ack[0], elapsed_ms(t_ack)))
+            });
+
+            let recv_task = recv_latest_drained(&mut frame_rx);
+
+            let (ack_join, recv_out) = tokio::join!(ack_task, recv_task);
+
+            let (ack_byte, ms_ack) = match ack_join {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    error!("ACK task failed: {e}");
+                    break;
+                }
+                Err(e) => {
+                    error!("ACK join failed: {e}");
+                    break;
+                }
+            };
+
+            match recv_out {
+                None => {
+                    info!("frame pipeline ended after {frame_count} iterations, {frames_dropped} dropped (sender closed)");
+                    break;
+                }
+                Some((next_latest, ch_sk, ms_recv_parallel)) => {
+                    latest = next_latest;
+                    prev_channel_skipped = ch_sk;
+                    prev_recv_ms = ms_recv_parallel;
+                    frames_dropped += ch_sk;
+                }
+            }
+
+            if ack_byte != 0x06 {
+                warn!(
+                    "rm-screen stream seq={stream_seq} unexpected ACK byte 0x{:02x} (expected 0x06)",
+                    ack_byte
+                );
+            }
+            if ms_ack >= 1500.0 {
+                warn!(
+                    "rm-screen stream seq={stream_seq} ACK slow: ack_wait_ms={ms_ack:.1} (tablet / tunnel / EPDC?)",
+                );
+            }
+
+            let full_iter_ms = elapsed_ms(tw_cycle);
+            info!(
+                "rm-screen stream seq={} full_iter_ms={:.2} recv_ms={:.1} drain_try_ms={:.1} channel_dropped={} \
+                 capture={}×{}@({},{}) fb={}×{}@({},{}) regions={} \
+                 pack_ms={:.2} lz4_ms={:.2} write_ms={:.2} gray4_B={} wire_B={} \
+                 ack_byte=0x{:02x} ack_wait_ms={:.2} (recv overlapped w/ ACK)",
+                stream_seq,
+                full_iter_ms,
+                ms_recv_wait,
+                ms_drain_spin,
+                skipped,
+                stats.capture_w,
+                stats.capture_h,
+                stats.capture_x0,
+                stats.capture_y0,
+                stats.fb_w,
+                stats.fb_h,
+                stats.fb_x,
+                stats.fb_y,
+                stats.region_rects,
+                stats.ms_pack,
+                stats.ms_lz4,
+                stats.ms_write,
+                stats.gray4_bytes,
+                stats.wire_bytes,
+                ack_byte,
+                ms_ack,
+            );
         } else {
-            // Nothing dirty — brief sleep so we don't busy-spin, then
-            // drain-to-latest will grab a newer frame.
+            if screen_cli.stream_trace {
+                info!(
+                    "rm-screen stream trace iter={frame_count} recv_wait_ms={ms_recv_wait:.1} drain_try_ms={ms_drain_spin:.1} \
+                     channel_dropped={skipped} (no encoded update; sleeping 16ms)",
+                );
+            } else if ms_recv_wait >= 2000.0 {
+                warn!(
+                    "rm-screen stream iter={frame_count} recv_wait_ms={ms_recv_wait:.1} — blocked ~{:.0}s waiting for PipeWire frame",
+                    ms_recv_wait / 1000.0,
+                );
+            }
             tokio::time::sleep(Duration::from_millis(16)).await;
+            match recv_latest_drained(&mut frame_rx).await {
+                None => {
+                    info!("frame pipeline ended after {frame_count} iterations (sender closed)");
+                    break;
+                }
+                Some((lf, sk, ms)) => {
+                    latest = lf;
+                    prev_channel_skipped = sk;
+                    prev_recv_ms = ms;
+                    frames_dropped += sk;
+                }
+            }
         }
     }
     drop(frame_rx);
@@ -357,8 +632,10 @@ async fn main() -> DynResult<()> {
     }
 
     info!("rm-screen session teardown…");
-    let _ = tunnel.kill();
-    let _ = tunnel.wait();
+    if let Some(mut t) = tunnel {
+        let _ = t.kill();
+        let _ = t.wait();
+    }
     lamco_pipewire::deinit();
     portal.cleanup().await.ok();
 
@@ -393,27 +670,105 @@ fn configure_tcp_stream(sock: &std::net::TcpStream) -> DynResult<()> {
     s.set_send_buffer_size(32 * 1024)?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
     s.set_tcp_keepalive(&ka)?;
+    let eff_snd = s.send_buffer_size().unwrap_or(0);
+    let eff_rcv = s.recv_buffer_size().unwrap_or(0);
+    info!(
+        "rm-screen TCP peer tuning: TCP_NODELAY on, SO_SNDBUF={} SO_RCVBUF={} (OS may round)",
+        eff_snd, eff_rcv,
+    );
     std::mem::forget(s);
     Ok(())
 }
 
+/// Host-side letterboxing: same geometry as `rm-client-screen` uses for capture → FB fit.
+struct Letterbox {
+    src_w: u32,
+    src_h: u32,
+    fb_w: u32,
+    fb_h: u32,
+    scale: f64,
+    off_x: u32,
+    off_y: u32,
+    dst_fit_w: u32,
+    dst_fit_h: u32,
+}
+
+impl Letterbox {
+    fn new(src_w: u32, src_h: u32, fb_w: u32, fb_h: u32) -> Self {
+        let scale = (fb_w as f64 / src_w as f64).min(fb_h as f64 / src_h as f64);
+        let dst_fit_w = ((src_w as f64 * scale).floor() as u32) & !1;
+        let dst_fit_h = (src_h as f64 * scale).floor() as u32;
+        let off_x = fb_w.saturating_sub(dst_fit_w) / 2;
+        let off_y = fb_h.saturating_sub(dst_fit_h) / 2;
+        Self {
+            src_w,
+            src_h,
+            fb_w,
+            fb_h,
+            scale,
+            off_x,
+            off_y,
+            dst_fit_w,
+            dst_fit_h,
+        }
+    }
+
+    /// Map a capture-space bounding box to framebuffer pixels (even width), matching tablet rounding.
+    fn capture_bbox_to_fb(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(u32, u32, u16, u16)> {
+        let dx0 = self.off_x as f64 + x0 as f64 * self.scale;
+        let dy0 = self.off_y as f64 + y0 as f64 * self.scale;
+        let dx1 = self.off_x as f64 + x1 as f64 * self.scale;
+        let dy1 = self.off_y as f64 + y1 as f64 * self.scale;
+        let ix0 = dx0.floor().max(0.0) as u32;
+        let iy0 = dy0.floor().max(0.0) as u32;
+        let ix1 = dx1.ceil().min(self.fb_w as f64) as u32;
+        let iy1 = dy1.ceil().min(self.fb_h as f64) as u32;
+        let mut out_w = ix1.saturating_sub(ix0);
+        out_w &= !1;
+        let out_h = iy1.saturating_sub(iy0);
+        if out_w < 2 || out_h < 1 {
+            return None;
+        }
+        Some((ix0, iy0, out_w as u16, out_h as u16))
+    }
+}
+
+/// Host-side timing snapshot for one successfully encoded and written update (`None` = nothing sent).
+struct StreamSendStats {
+    capture_x0: u32,
+    capture_y0: u32,
+    capture_w: u16,
+    capture_h: u16,
+    fb_x: u32,
+    fb_y: u32,
+    fb_w: u16,
+    fb_h: u16,
+    region_rects: usize,
+    gray4_bytes: usize,
+    wire_bytes: usize,
+    ms_pack: f64,
+    ms_lz4: f64,
+    ms_write: f64,
+}
+
 /// Merge all dirty regions into a single bounding-box update.
-/// Returns `true` if an update was sent (caller must wait for ACK).
-fn process_frame(
-    sock: &mut std::net::TcpStream,
+/// Returns wire buffer + stats (`ms_write` filled in by caller after `write_all`).
+fn encode_update(
     damage: &mut DamageDetector,
     frame: &VideoFrame,
-) -> DynResult<bool> {
+    lb: &Letterbox,
+) -> DynResult<Option<(Vec<u8>, StreamSendStats)>> {
     let Some(data_arc) = frame.data() else {
         warn!("DMA-BUF frame skipped (no CPU pixels); disable GPU-only capture in compositor if this repeats");
         damage.invalidate();
-        return Ok(false);
+        return Ok(None);
     };
     let data = data_arc.as_slice();
     let w = frame.width;
     let h = frame.height;
 
     let regions = regions_for_frame(frame, damage, data, w, h);
+    let region_rects = regions.len();
 
     // Merge all dirty rects into one bounding box.
     let mut x0 = w;
@@ -431,39 +786,75 @@ fn process_frame(
         y1 = y1.max(ry as u32 + rh as u32);
     }
     if x0 >= x1 || y0 >= y1 {
-        return Ok(false);
+        return Ok(None);
     }
-    let mx = x0 as u16;
-    let my = y0 as u16;
     let mw = ((x1 - x0) as u16) & !1;
     let mh = (y1 - y0) as u16;
     if mw < 2 || mh < 1 {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let packed = pack_region_gray4(data, frame.stride, frame.format, mx, my, mw, mh)?;
+    let cap_x1 = x0 + mw as u32;
+    let cap_y1 = y0 + mh as u32;
+    let Some((fb_ix, fb_iy, fb_mw, fb_mh)) = lb.capture_bbox_to_fb(x0, y0, cap_x1, cap_y1) else {
+        return Ok(None);
+    };
+
+    let tw_pack = Instant::now();
+    let packed = pack_region_gray4_fb(
+        data,
+        frame.stride,
+        frame.format,
+        lb,
+        fb_ix,
+        fb_iy,
+        fb_mw,
+        fb_mh,
+    )?;
+    let ms_pack = elapsed_ms(tw_pack);
+
+    let tw_lz4 = Instant::now();
     let compressed = lz4_flex::block::compress_prepend_size(&packed);
+    let ms_lz4 = elapsed_ms(tw_lz4);
+
     let header = UpdateHeader {
-        x: mx,
-        y: my,
-        width: mw,
-        height: mh,
-        waveform: WAVEFORM_DU,
+        x: fb_ix as u16,
+        y: fb_iy as u16,
+        width: fb_mw,
+        height: fb_mh,
+        waveform: UPDATE_COORDS_FRAMEBUFFER,
         payload_size: compressed.len() as u32,
     };
 
     let mut wire_buf = Vec::with_capacity(header.to_bytes().len() + compressed.len());
     wire_buf.extend_from_slice(&header.to_bytes());
     wire_buf.extend_from_slice(&compressed);
-    sock.write_all(&wire_buf)?;
-    sock.flush()?;
+    let wire_bytes = wire_buf.len();
 
     debug!(
-        "encoded frame {}×{} → merged {}×{} @ ({mx},{my}), {} B on wire",
-        w, h, mw, mh, wire_buf.len()
+        "encoded frame {}×{} → capture {}×{} @ ({},{}) → FB {}×{} @ ({fb_ix},{fb_iy}), {} B on wire",
+        w, h, mw, mh, x0, y0, fb_mw, fb_mh, wire_bytes
     );
 
-    Ok(true)
+    Ok(Some((
+        wire_buf,
+        StreamSendStats {
+            capture_x0: x0,
+            capture_y0: y0,
+            capture_w: mw,
+            capture_h: mh,
+            fb_x: fb_ix,
+            fb_y: fb_iy,
+            fb_w: fb_mw,
+            fb_h: fb_mh,
+            region_rects,
+            gray4_bytes: packed.len(),
+            wire_bytes,
+            ms_pack,
+            ms_lz4,
+            ms_write: 0.0,
+        },
+    )))
 }
 
 fn regions_for_frame(
@@ -534,32 +925,45 @@ fn gray_from_pixel(format: PixelFormat, chunk: &[u8]) -> Option<u8> {
     Some(((r as u16 * 77 + g as u16 * 150 + b as u16 * 29) >> 8) as u8)
 }
 
-fn pack_region_gray4(
+/// Sample capture at framebuffer pixel (screen_x, screen_y) using the same inverse map as the tablet.
+fn gray_at_fb_pixel(
     data: &[u8],
     stride: u32,
     format: PixelFormat,
-    ox: u16,
-    oy: u16,
+    lb: &Letterbox,
+    screen_x: u32,
+    screen_y: u32,
+) -> u8 {
+    let u = (screen_x as f64 + 0.5 - lb.off_x as f64) / lb.scale;
+    let v = (screen_y as f64 + 0.5 - lb.off_y as f64) / lb.scale;
+    let src_ix = u.floor().clamp(0.0, (lb.src_w.saturating_sub(1)) as f64) as u32;
+    let src_iy = v.floor().clamp(0.0, (lb.src_h.saturating_sub(1)) as f64) as u32;
+    let bpp = format.bytes_per_pixel().max(3);
+    let stride = stride as usize;
+    let row_off = src_iy as usize * stride;
+    let x0 = src_ix as usize * bpp;
+    let o0 = row_off + x0;
+    gray_from_pixel(format, &data[o0..data.len().min(o0 + bpp)]).unwrap_or(0)
+}
+
+/// Pack a region that already lies in framebuffer space (downsampled from capture on the host).
+fn pack_region_gray4_fb(
+    data: &[u8],
+    stride: u32,
+    format: PixelFormat,
+    lb: &Letterbox,
+    fb_ix0: u32,
+    fb_iy0: u32,
     w: u16,
     h: u16,
 ) -> DynResult<Vec<u8>> {
-    let bpp = format.bytes_per_pixel().max(3);
-    let stride = stride as usize;
     let mut out = Vec::with_capacity((w as usize / 2) * h as usize);
     for row in 0..h {
-        let y = oy as usize + row as usize;
-        let row_off = y * stride;
+        let screen_y = fb_iy0 + row as u32;
         for col in (0..w).step_by(2) {
-            let x0 = ox as usize + col as usize;
-            let x1 = x0 + 1;
-            let o0 = row_off + x0 * bpp;
-            let o1 = row_off + x1 * bpp;
-            let g0 = gray_from_pixel(format, &data[o0..data.len().min(o0 + bpp)]).unwrap_or(0);
-            let g1 = if x1 * bpp <= stride {
-                gray_from_pixel(format, &data[o1..data.len().min(o1 + bpp)]).unwrap_or(0)
-            } else {
-                0
-            };
+            let screen_x = fb_ix0 + col as u32;
+            let g0 = gray_at_fb_pixel(data, stride, format, lb, screen_x, screen_y);
+            let g1 = gray_at_fb_pixel(data, stride, format, lb, screen_x + 1, screen_y);
             let n0 = (g0 >> 4) & 0x0f;
             let n1 = (g1 >> 4) & 0x0f;
             out.push((n0 << 4) | n1);

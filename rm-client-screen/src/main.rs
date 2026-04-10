@@ -16,7 +16,7 @@ use libremarkable::framebuffer::common::{
 use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefreshMode};
 use log::{error, info, warn};
-use rm_common::protocol::{UpdateHeader, HEADER_SIZE};
+use rm_common::protocol::{UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -75,12 +75,17 @@ fn main() -> DynResult<()> {
         fb.var_screen_info.bits_per_pixel
     );
 
-    let refresh_mode = match std::env::var("RM_CLIENT_SCREEN_WAIT_REFRESH").as_deref() {
+    // Async returns before the panel finishes; we ACK immediately after, so the PC sends the
+    // next frame while the EPDC queue grows — lag compounds (seconds after ~1 min).  Wait keeps
+    // one refresh in flight, which matches our ACK pacing.
+    let refresh_mode = match std::env::var("RM_CLIENT_SCREEN_ASYNC_REFRESH").as_deref() {
         Ok("1") => {
-            info!("RM_CLIENT_SCREEN_WAIT_REFRESH=1 — blocking after each EPD partial update (slower, easier to debug)");
-            PartialRefreshMode::Wait
+            info!(
+                "RM_CLIENT_SCREEN_ASYNC_REFRESH=1 — do not wait for EPDC (lower latency *per* refresh if you can drain the queue; often worsens mirror lag)"
+            );
+            PartialRefreshMode::Async
         }
-        _ => PartialRefreshMode::Async,
+        _ => PartialRefreshMode::Wait,
     };
 
     run_stream(
@@ -177,10 +182,25 @@ fn run_stream(
         }
 
         let rgb565 = expand_gray4_packed(&raw, w, h);
-        if let Some((rect, patch)) = map_region_rgb565_to_fb(
-            &rgb565, w, h, header.x as u32, header.y as u32,
-            scale, off_x, off_y, fb_w, fb_h,
-        ) {
+        let mapped = if header.waveform == UPDATE_COORDS_FRAMEBUFFER {
+            let rect = mxcfb_rect {
+                top: header.y as u32,
+                left: header.x as u32,
+                width: w,
+                height: h,
+            };
+            if rect.width < 2 || rect.height < 1 {
+                None
+            } else {
+                Some((rect, rgb565))
+            }
+        } else {
+            map_region_rgb565_to_fb(
+                &rgb565, w, h, header.x as u32, header.y as u32,
+                scale, off_x, off_y, fb_w, fb_h,
+            )
+        };
+        if let Some((rect, patch)) = mapped {
             if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
                 error!("fb write {:?}: {e}", rect);
             } else {
@@ -219,8 +239,14 @@ fn run_stream(
 }
 
 fn send_ack(stream: &mut TcpStream) {
+    // Socket is non-blocking; `write_all` returns WouldBlock on a full send buffer and would drop
+    // the ACK, so the host blocks on `read_exact` and the tunnel piles up data.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.write_all(&[0x06]);
     let _ = stream.flush();
+    let _ = stream.set_nonblocking(true);
 }
 
 /// Parse all complete (header + full payload) updates from the front of `buf`,

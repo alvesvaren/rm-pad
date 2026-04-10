@@ -12,4 +12,6 @@ pub mod screen_client;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 
-pub use protocol::{UpdateHeader, HEADER_SIZE};
+pub use protocol::{
+    UpdateHeader, HEADER_SIZE, UPDATE_COORDS_CAPTURE, UPDATE_COORDS_FRAMEBUFFER,
+};

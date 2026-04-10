@@ -34,4 +34,13 @@ impl DeviceProfile {
     pub fn current() -> &'static Self {
         &RM2
     }
+
+    /// Physical framebuffer size in pixels (width × height) for screen mirroring.
+    pub fn framebuffer_size(&self) -> (u32, u32) {
+        match self.name {
+            "reMarkable 2" => (1404, 1872),
+            "reMarkable Paper Pro" => (1620, 2160),
+            _ => (1404, 1872),
+        }
+    }
 }

@@ -1,5 +1,13 @@
 //! Wire format for compressed 4-bit grayscale screen updates.
 
+/// `UpdateHeader.waveform` when `x,y,width,height` are in **host capture** coordinates
+/// and the LZ4 payload is gray4-packed at that resolution (tablet scales to FB).
+pub const UPDATE_COORDS_CAPTURE: u8 = 1;
+
+/// `UpdateHeader.waveform` when `x,y,width,height` are in **tablet framebuffer**
+/// coordinates and the payload is gray4-packed at that resolution (host pre-scaled).
+pub const UPDATE_COORDS_FRAMEBUFFER: u8 = 2;
+
 /// Header sent before each LZ4 payload (little-endian on wire, 13 bytes).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

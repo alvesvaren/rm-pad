@@ -116,6 +116,37 @@ fn ssh_tunnel_args(
     Ok(args)
 }
 
+/// Run a remote shell command over SSH without TCP port forwarding (direct TCP mode).
+pub fn spawn_remote_exec(
+    config: &Config,
+    remote_cmd: &str,
+) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
+    let mut args = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-p".into(),
+        "22".into(),
+    ];
+    args.extend(ssh_base_args(config)?);
+    args.push(format!("root@{}", config.host));
+    args.push(remote_cmd.into());
+
+    log::info!("Starting remote screen client: ssh {}", args.join(" "));
+
+    let child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    Ok(child)
+}
+
 /// Spawn `ssh -R remote_port:local_host:local_port ... exec remote_cmd`.
 /// Keep the child alive for the lifetime of the screen session; kill it on shutdown.
 pub fn spawn_reverse_tunnel(
@@ -209,8 +240,13 @@ pub fn detect_fb_shim(session: &Session) -> Result<Option<FbShim>, Box<dyn std::
 
 /// Build the `exec …` remote command for the screen client, setting the
 /// appropriate environment variables for the detected framebuffer shim.
+///
+/// `connect_host` / `connect_port` are where the tablet process reaches the PC listener
+/// (`127.0.0.1` + remote forwarded port over SSH reverse tunnel, or the PC LAN/USB IP
+/// + `local_port` for direct TCP).
 pub fn remote_screen_command(
-    remote_port: u16,
+    connect_host: &str,
+    connect_port: u16,
     src_w: u32,
     src_h: u32,
     shim: Option<&FbShim>,
@@ -223,8 +259,8 @@ pub fn remote_screen_command(
         None => String::new(),
     };
     format!(
-        "RUST_LOG=info {env_prefix}exec {} 127.0.0.1 {} {} {} 2>/tmp/rm-client-screen.log",
-        REMOTE_CLIENT_PATH, remote_port, src_w, src_h,
+        "RUST_LOG=info {env_prefix}exec {} {} {} {} {} 2>/tmp/rm-client-screen.log",
+        REMOTE_CLIENT_PATH, connect_host, connect_port, src_w, src_h,
     )
 }
 
