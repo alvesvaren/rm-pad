@@ -11,6 +11,67 @@ use crate::config::{Auth, Config};
 
 pub const REMOTE_CLIENT_PATH: &str = "/tmp/rm-client-screen";
 
+#[derive(Debug, Clone)]
+pub struct QtfbShimConfig {
+    pub input: bool,
+    pub model: bool,
+    pub mode: String,
+    pub dont_grab_input: bool,
+}
+
+impl Default for QtfbShimConfig {
+    fn default() -> Self {
+        Self {
+            input: false,
+            model: false,
+            mode: "RGB565".to_string(),
+            dont_grab_input: true,
+        }
+    }
+}
+
+impl QtfbShimConfig {
+    fn bool_str(v: bool) -> &'static str {
+        if v {
+            "true"
+        } else {
+            "false"
+        }
+    }
+
+    fn shell_env_pairs(&self) -> Vec<(String, String)> {
+        vec![
+            ("QTFB_SHIM_INPUT".to_string(), Self::bool_str(self.input).to_string()),
+            ("QTFB_SHIM_MODEL".to_string(), Self::bool_str(self.model).to_string()),
+            ("QTFB_SHIM_MODE".to_string(), self.mode.clone()),
+            (
+                "KO_DONT_GRAB_INPUT".to_string(),
+                if self.dont_grab_input { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB".to_string(),
+                "1".to_string(),
+            ),
+        ]
+    }
+
+    fn shell_env_prefix(&self) -> String {
+        self.shell_env_pairs()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn manifest_env_lines(&self) -> String {
+        self.shell_env_pairs()
+            .into_iter()
+            .map(|(key, value)| format!(r#",
+    "{}": "{}""#, key, value))
+            .collect::<String>()
+    }
+}
+
 fn compute_hash(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -250,16 +311,28 @@ pub fn remote_screen_command(
     src_w: u32,
     src_h: u32,
     shim: Option<&FbShim>,
+    latency_log: bool,
+    qtfb: &QtfbShimConfig,
+    exec_client: bool,
 ) -> String {
     let env_prefix = match shim {
-        Some(FbShim::QtfbShim(path)) => format!(
-            "LD_PRELOAD={path} QTFB_SHIM_MODEL=0 QTFB_SHIM_INPUT_MODE=NATIVE LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB=1 "
-        ),
+        Some(FbShim::QtfbShim(path)) => format!("LD_PRELOAD={path} {} ", qtfb.shell_env_prefix()),
         Some(FbShim::Rm2fb(path)) => format!("LD_PRELOAD={path} "),
         None => String::new(),
     };
+    let rust_log = if latency_log {
+        "info,rm_mirror_latency=info"
+    } else {
+        "info"
+    };
+    let latency_env = if latency_log {
+        "RM_MIRROR_LATENCY_LOG=1 "
+    } else {
+        ""
+    };
+    let exec_prefix = if exec_client { "exec " } else { "" };
     format!(
-        "RUST_LOG=info {env_prefix}exec {} {} {} {} {} 2>/tmp/rm-client-screen.log",
+        "RUST_LOG={rust_log} {latency_env}{env_prefix}{exec_prefix}{} {} {} {} {} 2>/tmp/rm-client-screen.log",
         REMOTE_CLIENT_PATH, connect_host, connect_port, src_w, src_h,
     )
 }
@@ -279,16 +352,23 @@ pub fn ensure_appload_manifest(
     port: u16,
     src_w: u32,
     src_h: u32,
+    latency_log: bool,
+    qtfb: &QtfbShimConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (preload, extra_env) = match shim {
-        FbShim::QtfbShim(path) => (
-            path.as_str(),
-            r#",
-    "QTFB_SHIM_MODEL": "0",
-    "QTFB_SHIM_INPUT_MODE": "NATIVE",
-    "LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB": "1""#,
-        ),
-        FbShim::Rm2fb(path) => (path.as_str(), ""),
+        FbShim::QtfbShim(path) => (path.as_str(), qtfb.manifest_env_lines()),
+        FbShim::Rm2fb(path) => (path.as_str(), String::new()),
+    };
+    let rust_log = if latency_log {
+        "info,rm_mirror_latency=info"
+    } else {
+        "info"
+    };
+    let latency_env = if latency_log {
+        r#",
+    "RM_MIRROR_LATENCY_LOG": "1""#
+    } else {
+        ""
     };
 
     let manifest = format!(
@@ -298,11 +378,11 @@ pub fn ensure_appload_manifest(
   "args": ["{}", "{}", "{}", "{}"],
   "environment": {{
     "LD_PRELOAD": "{}",
-    "RUST_LOG": "info"{}
+    "RUST_LOG": "{}"{}{}
   }},
   "qtfb": true
 }}"#,
-        REMOTE_CLIENT_PATH, host, port, src_w, src_h, preload, extra_env,
+        REMOTE_CLIENT_PATH, host, port, src_w, src_h, preload, rust_log, latency_env, extra_env,
     );
 
     let cmd = format!(
@@ -321,6 +401,40 @@ pub fn ensure_appload_manifest(
     }
     log::info!("AppLoad manifest installed at {}/external.manifest.json", APPLOAD_APP_DIR);
     Ok(())
+}
+
+pub fn describe_shim_launch_env(shim: Option<&FbShim>, qtfb: &QtfbShimConfig) -> String {
+    match shim {
+        Some(FbShim::QtfbShim(path)) => {
+            format!("LD_PRELOAD={path} {}", qtfb.shell_env_prefix())
+        }
+        Some(FbShim::Rm2fb(path)) => format!("LD_PRELOAD={path}"),
+        None => "(no shim env)".to_string(),
+    }
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+pub fn wrap_xochitl_exclusive_command(client_cmd: &str) -> String {
+    let script = format!(
+        "had_xochitl=0; \
+         if systemctl is-active --quiet xochitl; then \
+           had_xochitl=1; \
+           systemctl stop xochitl || true; \
+         fi; \
+         cleanup() {{ \
+           if [ \"$had_xochitl\" -eq 1 ]; then \
+             systemctl start xochitl || true; \
+           fi; \
+         }}; \
+         trap cleanup EXIT INT TERM; \
+         {client_cmd}; \
+         status=$?; \
+         exit $status"
+    );
+    format!("sh -lc {}", shell_single_quote(&script))
 }
 
 /// Load client binary for the given tablet architecture from disk.

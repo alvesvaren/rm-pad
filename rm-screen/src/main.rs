@@ -1,13 +1,13 @@
 //! PC-side screen mirror: PipeWire (via portal) → dirty regions → LZ4 → TCP to tablet.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ashpd::desktop::PersistMode;
 use clap::Parser;
@@ -22,7 +22,7 @@ use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
 use rm_common::expand_rect_to_epdc_grid;
 use rm_common::grab;
-use rm_common::protocol::{UpdateHeader, UPDATE_COORDS_FRAMEBUFFER};
+use rm_common::protocol::{unix_time_millis, BatchAck, UpdateHeader, ACK_OK, ACK_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 use rm_common::screen_client::{
     self, ensure_client_on_device, load_client_binary, spawn_remote_exec, spawn_reverse_tunnel,
 };
@@ -34,15 +34,208 @@ type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// PipeWire → main queue depth. Larger values let `recv_latest_drained` pick a fresher frame while
 /// the main task is encoding or waiting for ACK (capacity 2 was stalling the bridge often).
 const FRAME_CHANNEL_CAP: usize = 32;
+/// Keep only one batch in flight by default. The tablet-side display path is still the visible
+/// bottleneck, so letting the host queue multiple batches mainly increases perceived lag.
+const MAX_INFLIGHT_BATCHES: usize = 1;
 
 fn elapsed_ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// `DamageConfig::low_bandwidth` uses 32px tiles and very low thresholds. Gradients, video-like
-/// noise, and subpixel text can then mark almost every tile inside a compositor damage tile, so the
-/// merged bbox becomes a huge rectangle (~384×416) even when you only “see” a small change.
-/// Finer tiles and slightly stricter thresholds track visible edits more tightly (more CPU).
+fn elapsed_ms_between(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1000.0
+}
+
+struct PendingBatch {
+    batch_id: u32,
+    batch_start_seq: u64,
+    part_logs: Vec<StreamSendStats>,
+    parts: usize,
+    first_host_unix_ms: u64,
+    encode_ms: f64,
+    tcp_write_ms: f64,
+    sent_at: Instant,
+    recv_ms: f64,
+    drain_try_ms: f64,
+    skipped: u64,
+    send_iter_ms: f64,
+    pw_header_age_ms: Option<f64>,
+    local_queue_age_ms: Option<f64>,
+    pw_seq: Option<u64>,
+}
+
+fn next_nonzero_batch_id(next_batch_id: &mut u32) -> u32 {
+    let out = *next_batch_id;
+    *next_batch_id = next_batch_id.wrapping_add(1);
+    if *next_batch_id == 0 {
+        *next_batch_id = 1;
+    }
+    out
+}
+
+fn system_time_age_ms(at: SystemTime) -> Option<f64> {
+    SystemTime::now()
+        .duration_since(at)
+        .ok()
+        .map(|d| d.as_secs_f64() * 1000.0)
+}
+
+fn pipewire_header_age_ms(frame: &VideoFrame) -> Option<f64> {
+    let hdr = frame.meta.header.as_ref()?;
+    let hdr_pts = u64::try_from(hdr.pts).ok()?;
+    Some(frame.pts.saturating_sub(hdr_pts) as f64 / 1_000_000.0)
+}
+
+fn fmt_opt_ms(v: Option<f64>) -> String {
+    match v {
+        Some(ms) => format!("{ms:.2}"),
+        None => "na".to_string(),
+    }
+}
+
+fn fmt_opt_u64(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "na".to_string(),
+    }
+}
+
+fn log_batch_ack(batch: PendingBatch, ack: BatchAck, latency_log: bool, inflight_now: usize) {
+    let ms_ack_batch = elapsed_ms(batch.sent_at);
+    if ack.status != ACK_OK {
+        warn!(
+            "rm-screen batch {} unexpected ACK status 0x{:02x} (expected 0x{:02x})",
+            ack.batch_id,
+            ack.status,
+            ACK_OK,
+        );
+    }
+    if latency_log {
+        let host_wall_ms = unix_time_millis();
+        info!(
+            target: "rm_mirror_latency",
+            "host batch id={} seq={}..{} parts={} encode_ms={:.2} tcp_write_ms={:.2} ack_wait_ms={:.2} inflight_now={} first_host_unix_ms={} host_wall_now_ms={} \
+             pw_header_age_ms={} local_queue_age_ms={} pw_seq={} \
+             | high ack_wait_ms means the tablet/tunnel is still lagging; with windowing the host no longer blocks every iteration on it",
+            batch.batch_id,
+            batch.batch_start_seq + 1,
+            batch.batch_start_seq + batch.parts as u64,
+            batch.parts,
+            batch.encode_ms,
+            batch.tcp_write_ms,
+            ms_ack_batch,
+            inflight_now,
+            batch.first_host_unix_ms,
+            host_wall_ms,
+            fmt_opt_ms(batch.pw_header_age_ms),
+            fmt_opt_ms(batch.local_queue_age_ms),
+            fmt_opt_u64(batch.pw_seq),
+        );
+    }
+    let ack_warn_ms = 1500.0 * batch.parts.max(1) as f64;
+    if ms_ack_batch >= ack_warn_ms {
+        warn!(
+            "rm-screen batch id={} seq={}..{} ACK slow: ack_wait_ms={ms_ack_batch:.1} (tablet / tunnel / EPDC?)",
+            batch.batch_id,
+            batch.batch_start_seq + 1,
+            batch.batch_start_seq + batch.parts as u64,
+        );
+    }
+    if !latency_log {
+        let ms_write_per = batch.tcp_write_ms / batch.parts.max(1) as f64;
+        for (part_i, mut stats) in batch.part_logs.into_iter().enumerate() {
+            let is_last_part = part_i + 1 == batch.parts;
+            stats.ms_write = ms_write_per;
+            let this_seq = batch.batch_start_seq + part_i as u64 + 1;
+            info!(
+                "rm-screen stream seq={} batch_id={} part={}/{} send_iter_ms={:.2} recv_ms={:.1} drain_try_ms={:.1} channel_dropped={} \
+                 capture={}×{}@({},{}) fb={}×{}@({},{}) regions={} sparse_parts={} \
+                 pack_ms={:.2} lz4_ms={:.2} write_ms={:.2} payload_B={} wire_B={} \
+                 batch_ack_ms={:.2} {}",
+                this_seq,
+                batch.batch_id,
+                part_i + 1,
+                batch.parts,
+                batch.send_iter_ms,
+                batch.recv_ms,
+                batch.drain_try_ms,
+                batch.skipped,
+                stats.capture_w,
+                stats.capture_h,
+                stats.capture_x0,
+                stats.capture_y0,
+                stats.fb_w,
+                stats.fb_h,
+                stats.fb_x,
+                stats.fb_y,
+                stats.region_rects,
+                stats.sparse_parts,
+                stats.ms_pack,
+                stats.ms_lz4,
+                stats.ms_write,
+                stats.payload_bytes,
+                stats.wire_bytes,
+                ms_ack_batch,
+                if is_last_part {
+                    "(batch ACK; host send is windowed)"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+}
+
+fn handle_batch_ack(
+    inflight: &mut VecDeque<PendingBatch>,
+    ack: BatchAck,
+    latency_log: bool,
+) -> DynResult<()> {
+    let pos = inflight
+        .iter()
+        .position(|batch| batch.batch_id == ack.batch_id)
+        .ok_or_else(|| format!("received ACK for unknown batch id {}", ack.batch_id))?;
+    let batch = inflight
+        .remove(pos)
+        .ok_or_else(|| format!("missing inflight batch id {}", ack.batch_id))?;
+    log_batch_ack(batch, ack, latency_log, inflight.len());
+    Ok(())
+}
+
+fn drain_batch_acks(
+    ack_rx: &mpsc::Receiver<Result<BatchAck, String>>,
+    inflight: &mut VecDeque<PendingBatch>,
+    latency_log: bool,
+) -> DynResult<()> {
+    loop {
+        match ack_rx.try_recv() {
+            Ok(Ok(ack)) => handle_batch_ack(inflight, ack, latency_log)?,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("ACK reader disconnected".into());
+            }
+        }
+    }
+}
+
+fn wait_for_batch_slot(
+    ack_rx: &mpsc::Receiver<Result<BatchAck, String>>,
+    inflight: &mut VecDeque<PendingBatch>,
+    latency_log: bool,
+) -> DynResult<()> {
+    while inflight.len() >= MAX_INFLIGHT_BATCHES {
+        match ack_rx.recv() {
+            Ok(Ok(ack)) => handle_batch_ack(inflight, ack, latency_log)?,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err("ACK reader disconnected".into()),
+        }
+    }
+    Ok(())
+}
+
+/// Tuned between `low_bandwidth` (noisy → huge merged bboxes) and overly strict thresholds
+/// that drop real UI updates.
 fn damage_config_for_screen_mirror() -> DamageConfig {
     DamageConfig {
         tile_size: 16,
@@ -122,10 +315,36 @@ struct ScreenCli {
     #[arg(long)]
     stream_trace: bool,
 
-    /// Use PipeWire / compositor damage rectangles when present (often coarse tiles, not actual pixels).
-    /// Default is host-side pixel diff for tight BGRx buffers — matches real on-screen changes.
-    #[arg(long, env = "RM_SCREEN_PREFER_PORTAL_DAMAGE")]
-    prefer_portal_damage: bool,
+    /// Log per-batch timing breakdown (`RM_MIRROR_LATENCY_LOG=1` or `true`).
+    #[arg(long, default_value_t = false, env = "RM_MIRROR_LATENCY_LOG", value_parser = clap::builder::BoolishValueParser::new())]
+    latency_log: bool,
+
+    /// Max separate bboxes (TCP+EPDC) per PipeWire frame when damage is spatially sparse.
+    /// **1** = single merged rect (min ioctl count; can look like a big “flash” when holes are sparse).
+    /// **8** (default) splits disjoint damage without exploding into 16+ serial refreshes.
+    #[arg(long, default_value_t = 8, env = "RM_SCREEN_SPARSE_PARTS_MAX")]
+    sparse_parts_max: usize,
+
+    /// Modern qtfb-shim input handling toggle (`QTFB_SHIM_INPUT`).
+    #[arg(long, default_value_t = false, env = "RM_SCREEN_QTFB_SHIM_INPUT", value_parser = clap::builder::BoolishValueParser::new())]
+    qtfb_shim_input: bool,
+
+    /// Modern qtfb-shim model handling toggle (`QTFB_SHIM_MODEL`).
+    #[arg(long, default_value_t = false, env = "RM_SCREEN_QTFB_SHIM_MODEL", value_parser = clap::builder::BoolishValueParser::new())]
+    qtfb_shim_model: bool,
+
+    /// qtfb-shim framebuffer mode (`QTFB_SHIM_MODE`), e.g. `RGB565`.
+    #[arg(long, default_value = "RGB565", env = "RM_SCREEN_QTFB_SHIM_MODE")]
+    qtfb_shim_mode: String,
+
+    /// Export `KO_DONT_GRAB_INPUT=1` for qtfb-shim launches.
+    #[arg(long, default_value_t = true, env = "RM_SCREEN_QTFB_SHIM_DONT_GRAB_INPUT", value_parser = clap::builder::BoolishValueParser::new())]
+    qtfb_shim_dont_grab_input: bool,
+
+    /// Experimental: stop `xochitl` and run the mirror client directly for the session,
+    /// bypassing AppLoad/qtfb-shim presentation cadence entirely.
+    #[arg(long, default_value_t = false, env = "RM_SCREEN_EXCLUSIVE_DISPLAY", value_parser = clap::builder::BoolishValueParser::new())]
+    exclusive_display: bool,
 }
 
 #[tokio::main]
@@ -133,6 +352,16 @@ async fn main() -> DynResult<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let screen_cli = ScreenCli::parse();
+    if cfg!(debug_assertions) {
+        warn!(
+            "rm-screen is running as a debug build; host encode latency can be dramatically worse. \
+             For real performance measurements use `cargo run --release -p rm-screen -- ...` \
+             or `target/release/rm-screen`."
+        );
+    }
+    if screen_cli.latency_log {
+        info!("--latency-log: enable RUST_LOG=rm_mirror_latency=info,info for timing lines; set RM_MIRROR_LATENCY_LOG=1 on the tablet client too");
+    }
     let device = DeviceProfile::current();
     let config = load_merged_config(&screen_cli, device);
 
@@ -145,9 +374,32 @@ async fn main() -> DynResult<()> {
     let client_bytes = load_client_binary(&screen_cli.client_binary)?;
     ensure_client_on_device(&session, &client_bytes)?;
     let fb_shim = screen_client::detect_fb_shim(&session)?;
-    let appload_launch = matches!(&fb_shim, Some(screen_client::FbShim::QtfbShim(_)));
+    let qtfb_shim = screen_client::QtfbShimConfig {
+        input: screen_cli.qtfb_shim_input,
+        model: screen_cli.qtfb_shim_model,
+        mode: screen_cli.qtfb_shim_mode.clone(),
+        dont_grab_input: screen_cli.qtfb_shim_dont_grab_input,
+    };
+    let launch_shim = if screen_cli.exclusive_display {
+        None
+    } else {
+        fb_shim.as_ref()
+    };
+    let appload_launch = !screen_cli.exclusive_display
+        && matches!(launch_shim, Some(screen_client::FbShim::QtfbShim(_)));
     if appload_launch {
         info!("qtfb-shim detected — client will be launched from AppLoad on the tablet");
+    }
+    if screen_cli.exclusive_display {
+        warn!(
+            "--exclusive-display: stopping xochitl for the session and launching rm-client-screen directly; \
+             this bypasses AppLoad/qtfb-shim but is more invasive"
+        );
+    } else if launch_shim.is_some() {
+        info!(
+            "tablet launch env: {}",
+            screen_client::describe_shim_launch_env(launch_shim, &qtfb_shim)
+        );
     }
     match &fb_shim {
         None if device.name == "reMarkable 2" => {
@@ -270,7 +522,9 @@ async fn main() -> DynResult<()> {
         let mut pw_thread = pw_thread;
         let mut bridged: u64 = 0;
         loop {
-            if let Some(frame) = pw_thread.recv_frame_timeout(Duration::from_millis(100)) {
+            // Lower cap than 100ms so a lull in PipeWire delivery does not add up to 600ms-class holes
+            // before the next frame reaches the encoder (timeout only applies when no frame is queued).
+            if let Some(frame) = pw_thread.recv_frame_timeout(Duration::from_millis(16)) {
                 bridged += 1;
                 if bridged == 1 {
                     debug!(
@@ -315,11 +569,13 @@ async fn main() -> DynResult<()> {
             let session = ssh::connect_for_detection(&config)?;
             screen_client::ensure_appload_manifest(
                 &session,
-                fb_shim.as_ref().expect("appload_launch implies shim"),
+                launch_shim.expect("appload_launch implies shim"),
                 pc_host,
                 pc_port,
                 stream_info.size.0,
                 stream_info.size.1,
+                screen_cli.latency_log,
+                &qtfb_shim,
             )?;
             drop(session);
             info!(
@@ -334,8 +590,16 @@ async fn main() -> DynResult<()> {
                 pc_port,
                 stream_info.size.0,
                 stream_info.size.1,
-                fb_shim.as_ref(),
+                launch_shim,
+                screen_cli.latency_log,
+                &qtfb_shim,
+                !screen_cli.exclusive_display,
             );
+            let remote_cmd = if screen_cli.exclusive_display {
+                screen_client::wrap_xochitl_exclusive_command(&remote_cmd)
+            } else {
+                remote_cmd
+            };
             info!("remote client command: {}", remote_cmd);
             Some(spawn_remote_exec(&config, &remote_cmd)?)
         }
@@ -343,11 +607,13 @@ async fn main() -> DynResult<()> {
         let session = ssh::connect_for_detection(&config)?;
         screen_client::ensure_appload_manifest(
             &session,
-            fb_shim.as_ref().expect("appload_launch implies shim"),
+            launch_shim.expect("appload_launch implies shim"),
             "127.0.0.1",
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
+            screen_cli.latency_log,
+            &qtfb_shim,
         )?;
         drop(session);
         info!(
@@ -367,8 +633,16 @@ async fn main() -> DynResult<()> {
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
-            fb_shim.as_ref(),
+            launch_shim,
+            screen_cli.latency_log,
+            &qtfb_shim,
+            !screen_cli.exclusive_display,
         );
+        let remote_cmd = if screen_cli.exclusive_display {
+            screen_client::wrap_xochitl_exclusive_command(&remote_cmd)
+        } else {
+            remote_cmd
+        };
         info!(
             "remote client command: {} (capture {}×{})",
             remote_cmd, stream_info.size.0, stream_info.size.1
@@ -423,10 +697,30 @@ async fn main() -> DynResult<()> {
         _ => info!("tablet connected; starting screen encode"),
     }
     configure_tcp_stream(&sock)?;
-    let sock_read = Arc::new(Mutex::new(
-        sock.try_clone()
-            .map_err(|e| format!("TCP try_clone for ACK reads: {e}"))?,
-    ));
+    let mut ack_sock = sock
+        .try_clone()
+        .map_err(|e| format!("TCP try_clone for ACK reads: {e}"))?;
+    let (ack_tx, ack_rx) = mpsc::channel::<Result<BatchAck, String>>();
+    let ack_reader = std::thread::spawn(move || {
+        loop {
+            let mut buf = [0u8; ACK_SIZE];
+            match ack_sock.read_exact(&mut buf) {
+                Ok(()) => {
+                    let Some(ack) = BatchAck::from_bytes(&buf) else {
+                        let _ = ack_tx.send(Err("malformed batch ACK".to_string()));
+                        break;
+                    };
+                    if ack_tx.send(Ok(ack)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = ack_tx.send(Err(format!("ACK read: {e}")));
+                    break;
+                }
+            }
+        }
+    });
 
     let mut sock = sock;
     let mut damage = DamageDetector::new(damage_config_for_screen_mirror());
@@ -443,25 +737,33 @@ async fn main() -> DynResult<()> {
         stream_info.size.0,
         stream_info.size.1
     );
-    info!(
-        "rm-screen stream log: one INFO line per update (ACK runs in parallel with fetching the next frame). \
-         Use --stream-trace for iterations with no dirty region."
-    );
-    if screen_cli.prefer_portal_damage {
-        info!(
-            "dirty regions: using portal/compositor damage when present (may be oversized — set RM_SCREEN_PREFER_PORTAL_DAMAGE=0 to use pixel diff)"
-        );
+    if screen_cli.latency_log {
+        info!("rm-screen latency mode: logging concise batch timing summaries plus rm_mirror_latency lines");
     } else {
         info!(
-            "dirty regions: host pixel diff (real changes) for tight BGRx/BGRA buffers; \
-             portal rectangles only as fallback; --prefer-portal-damage for compositor tiles only"
+            "rm-screen stream log: one INFO line per update (ACK runs in parallel with fetching the next frame). \
+             Use --stream-trace for iterations with no dirty region."
         );
     }
+    let sparse_raw = screen_cli.sparse_parts_max;
+    let sparse_parts_max = sparse_raw.clamp(1, 16);
+    if sparse_raw != sparse_parts_max {
+        warn!(
+            "--sparse-parts-max {sparse_raw} clamped to {sparse_parts_max} (valid range 1–16)",
+        );
+    }
+    info!("sparse_parts_max={sparse_parts_max}");
+    info!("damage: host pixel diff vs previous PipeWire frame (BGRx tiles → merged regions)");
 
     let mut frame_count: u64 = 0;
     let mut frames_dropped: u64 = 0;
     let mut last_progress = Instant::now();
     let mut stream_seq: u64 = 0;
+    let mut next_batch_id: u32 = 1;
+    let mut inflight_batches: VecDeque<PendingBatch> = VecDeque::new();
+    // Reused packed BGRx rows when PipeWire uses stride > width×4 (compositor padding).
+    let mut tight_bgra_scratch: Vec<u8> = Vec::new();
+    let mut logged_stride_pack: bool = false;
 
     let (mut latest, mut prev_channel_skipped, mut prev_recv_ms) =
         match recv_latest_drained(&mut frame_rx).await {
@@ -476,10 +778,21 @@ async fn main() -> DynResult<()> {
     frames_dropped += prev_channel_skipped;
 
     'stream: loop {
+        if let Err(e) = drain_batch_acks(&ack_rx, &mut inflight_batches, screen_cli.latency_log) {
+            error!("ACK drain failed: {e}");
+            break;
+        }
+        if let Err(e) = wait_for_batch_slot(&ack_rx, &mut inflight_batches, screen_cli.latency_log) {
+            error!("ACK wait failed: {e}");
+            break;
+        }
         let tw_cycle = Instant::now();
         let skipped = prev_channel_skipped;
         let ms_recv_wait = prev_recv_ms;
         let ms_drain_spin = 0.0_f64;
+        let pw_header_age_ms = pipewire_header_age_ms(&latest);
+        let local_queue_age_ms = system_time_age_ms(latest.capture_time);
+        let pw_seq = latest.meta.header.as_ref().map(|hdr| hdr.seq);
 
         frame_count += 1;
         if frame_count <= 3 {
@@ -528,7 +841,10 @@ async fn main() -> DynResult<()> {
             &mut damage,
             &latest,
             &lb,
-            screen_cli.prefer_portal_damage,
+            next_batch_id,
+            sparse_parts_max,
+            &mut tight_bgra_scratch,
+            &mut logged_stride_pack,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -539,126 +855,74 @@ async fn main() -> DynResult<()> {
         };
 
         if !encode_workloads.is_empty() {
-            let n_parts = encode_workloads.len();
-            for (part_i, (wire_buf, mut stats)) in encode_workloads.into_iter().enumerate() {
-                let is_last_part = part_i + 1 == n_parts;
-                stream_seq += 1;
+            let batch_id = next_nonzero_batch_id(&mut next_batch_id);
+            let workloads = encode_workloads;
+            let n_parts = workloads.len();
+            let batch_start_seq = stream_seq;
 
-                let tw_write = Instant::now();
-                if let Err(e) = sock.write_all(&wire_buf) {
+            let tw_write = Instant::now();
+            let mut write_ok = true;
+            for (wire_buf, _) in workloads.iter() {
+                if let Err(e) = sock.write_all(wire_buf) {
                     error!("TCP write failed: {e}");
                     info!("stopped after {frame_count} frames sent");
-                    break 'stream;
+                    write_ok = false;
+                    break;
                 }
-                if let Err(e) = sock.flush() {
-                    error!("TCP flush failed: {e}");
-                    break 'stream;
-                }
-                stats.ms_write = elapsed_ms(tw_write);
+            }
+            if !write_ok {
+                break 'stream;
+            }
+            if let Err(e) = sock.flush() {
+                error!("TCP flush failed: {e}");
+                break 'stream;
+            }
+            let ms_write_batch = elapsed_ms(tw_write);
+            let ms_encode_batch = elapsed_ms_between(tw_cycle, tw_write);
+            let first_host_unix_ms = workloads
+                .first()
+                .map(|(_, s)| s.host_unix_ms)
+                .unwrap_or(0);
 
-                let sock_r = sock_read.clone();
-                let ack_task = tokio::task::spawn_blocking(move || {
-                    let mut guard = sock_r
-                        .lock()
-                        .map_err(|e| format!("ACK lock poisoned: {e}"))?;
-                    let t_ack = Instant::now();
-                    let mut ack = [0u8; 1];
-                    guard
-                        .read_exact(&mut ack)
-                        .map_err(|e| format!("ACK read: {e}"))?;
-                    Ok::<_, String>((ack[0], elapsed_ms(t_ack)))
-                });
-
-                let (ack_byte, ms_ack) = if is_last_part {
-                    let recv_task = recv_latest_drained(&mut frame_rx);
-                    let (ack_join, recv_out) = tokio::join!(ack_task, recv_task);
-
-                    let ack_pair = match ack_join {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            error!("ACK task failed: {e}");
-                            break 'stream;
-                        }
-                        Err(e) => {
-                            error!("ACK join failed: {e}");
-                            break 'stream;
-                        }
-                    };
-
-                    match recv_out {
-                        None => {
-                            info!("frame pipeline ended after {frame_count} iterations, {frames_dropped} dropped (sender closed)");
-                            break 'stream;
-                        }
-                        Some((next_latest, ch_sk, ms_recv_parallel)) => {
-                            latest = next_latest;
-                            prev_channel_skipped = ch_sk;
-                            prev_recv_ms = ms_recv_parallel;
-                            frames_dropped += ch_sk;
-                        }
-                    }
-                    ack_pair
-                } else {
-                    match ack_task.await {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            error!("ACK task failed: {e}");
-                            break 'stream;
-                        }
-                        Err(e) => {
-                            error!("ACK join failed: {e}");
-                            break 'stream;
-                        }
-                    }
-                };
-
-                if ack_byte != 0x06 {
-                    warn!(
-                        "rm-screen stream seq={stream_seq} unexpected ACK byte 0x{:02x} (expected 0x06)",
-                        ack_byte
-                    );
-                }
-                if ms_ack >= 1500.0 {
-                    warn!(
-                        "rm-screen stream seq={stream_seq} ACK slow: ack_wait_ms={ms_ack:.1} (tablet / tunnel / EPDC?)",
-                    );
-                }
-
-                let full_iter_ms = elapsed_ms(tw_cycle);
+            stream_seq += n_parts as u64;
+            let send_iter_ms = elapsed_ms(tw_cycle);
+            inflight_batches.push_back(PendingBatch {
+                batch_id,
+                batch_start_seq,
+                part_logs: workloads.into_iter().map(|(_, stats)| stats).collect(),
+                parts: n_parts,
+                first_host_unix_ms,
+                encode_ms: ms_encode_batch,
+                tcp_write_ms: ms_write_batch,
+                sent_at: Instant::now(),
+                recv_ms: ms_recv_wait,
+                drain_try_ms: ms_drain_spin,
+                skipped,
+                send_iter_ms,
+                pw_header_age_ms,
+                local_queue_age_ms,
+                pw_seq,
+            });
+            if screen_cli.latency_log {
+                let host_wall_ms = unix_time_millis();
                 info!(
-                    "rm-screen stream seq={} part={}/{} full_iter_ms={:.2} recv_ms={:.1} drain_try_ms={:.1} channel_dropped={} \
-                     capture={}×{}@({},{}) fb={}×{}@({},{}) regions={} sparse_parts={} \
-                     pack_ms={:.2} lz4_ms={:.2} write_ms={:.2} gray4_B={} wire_B={} \
-                     ack_byte=0x{:02x} ack_wait_ms={:.2} {}",
-                    stream_seq,
-                    part_i + 1,
+                    target: "rm_mirror_latency",
+                    "host batch sent id={} seq={}..{} parts={} encode_ms={:.2} tcp_write_ms={:.2} send_iter_ms={:.2} inflight_now={} first_host_unix_ms={} host_wall_now_ms={} \
+                     pw_header_age_ms={} local_queue_age_ms={} pw_seq={} \
+                     | the host can now keep newer batches in flight instead of blocking on every ACK",
+                    batch_id,
+                    batch_start_seq + 1,
+                    batch_start_seq + n_parts as u64,
                     n_parts,
-                    full_iter_ms,
-                    ms_recv_wait,
-                    ms_drain_spin,
-                    skipped,
-                    stats.capture_w,
-                    stats.capture_h,
-                    stats.capture_x0,
-                    stats.capture_y0,
-                    stats.fb_w,
-                    stats.fb_h,
-                    stats.fb_x,
-                    stats.fb_y,
-                    stats.region_rects,
-                    stats.sparse_parts,
-                    stats.ms_pack,
-                    stats.ms_lz4,
-                    stats.ms_write,
-                    stats.gray4_bytes,
-                    stats.wire_bytes,
-                    ack_byte,
-                    ms_ack,
-                    if is_last_part {
-                        "(recv overlapped w/ ACK on last part)"
-                    } else {
-                        ""
-                    },
+                    ms_encode_batch,
+                    ms_write_batch,
+                    send_iter_ms,
+                    inflight_batches.len(),
+                    first_host_unix_ms,
+                    host_wall_ms,
+                    fmt_opt_ms(pw_header_age_ms),
+                    fmt_opt_ms(local_queue_age_ms),
+                    fmt_opt_u64(pw_seq),
                 );
             }
         } else {
@@ -673,23 +937,25 @@ async fn main() -> DynResult<()> {
                     ms_recv_wait / 1000.0,
                 );
             }
-            // No extra sleep: `recv` already paces us at PipeWire rate; an unconditional delay here
-            // added ~16ms of input lag whenever a frame had no detectable damage.
-            match recv_latest_drained(&mut frame_rx).await {
-                None => {
-                    info!("frame pipeline ended after {frame_count} iterations (sender closed)");
-                    break;
-                }
-                Some((lf, sk, ms)) => {
-                    latest = lf;
-                    prev_channel_skipped = sk;
-                    prev_recv_ms = ms;
-                    frames_dropped += sk;
-                }
+        }
+        match recv_latest_drained(&mut frame_rx).await {
+            None => {
+                info!("frame pipeline ended after {frame_count} iterations (sender closed)");
+                break;
+            }
+            Some((lf, sk, ms)) => {
+                latest = lf;
+                prev_channel_skipped = sk;
+                prev_recv_ms = ms;
+                frames_dropped += sk;
             }
         }
     }
     drop(frame_rx);
+    drop(sock);
+    if let Err(e) = ack_reader.join() {
+        error!("ACK reader thread join: {e:?}");
+    }
     if let Err(e) = bridge.join() {
         error!("frame bridge thread join: {e:?}");
     }
@@ -754,6 +1020,8 @@ struct Letterbox {
     off_y: u32,
     dst_fit_w: u32,
     dst_fit_h: u32,
+    fb_x_to_src_x: Vec<u32>,
+    fb_y_to_src_y: Vec<u32>,
 }
 
 impl Letterbox {
@@ -763,6 +1031,8 @@ impl Letterbox {
         let dst_fit_h = (src_h as f64 * scale).floor() as u32;
         let off_x = fb_w.saturating_sub(dst_fit_w) / 2;
         let off_y = fb_h.saturating_sub(dst_fit_h) / 2;
+        let fb_x_to_src_x = build_fb_to_src_axis_map(fb_w, off_x, scale, src_w);
+        let fb_y_to_src_y = build_fb_to_src_axis_map(fb_h, off_y, scale, src_h);
         Self {
             src_w,
             src_h,
@@ -773,6 +1043,8 @@ impl Letterbox {
             off_y,
             dst_fit_w,
             dst_fit_h,
+            fb_x_to_src_x,
+            fb_y_to_src_y,
         }
     }
 
@@ -794,6 +1066,27 @@ impl Letterbox {
         }
         Some((ix0, iy0, out_w as u16, out_h as u16))
     }
+
+    #[inline]
+    fn src_x_at_fb(&self, screen_x: u32) -> u32 {
+        self.fb_x_to_src_x[screen_x.min(self.fb_w.saturating_sub(1)) as usize]
+    }
+
+    #[inline]
+    fn src_y_at_fb(&self, screen_y: u32) -> u32 {
+        self.fb_y_to_src_y[screen_y.min(self.fb_h.saturating_sub(1)) as usize]
+    }
+}
+
+fn build_fb_to_src_axis_map(fb_len: u32, off: u32, scale: f64, src_len: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(fb_len as usize);
+    let src_max = src_len.saturating_sub(1) as f64;
+    let off = off as f64;
+    for screen in 0..fb_len {
+        let pos = (screen as f64 + 0.5 - off) / scale;
+        out.push(pos.floor().clamp(0.0, src_max) as u32);
+    }
+    out
 }
 
 /// Host-side timing snapshot for one successfully encoded and written update (`None` = nothing sent).
@@ -809,19 +1102,58 @@ struct StreamSendStats {
     region_rects: usize,
     /// Same PipeWire frame split into N TCP updates (1 = single merged rect).
     sparse_parts: u8,
-    gray4_bytes: usize,
+    payload_bytes: usize,
     wire_bytes: usize,
     ms_pack: f64,
     ms_lz4: f64,
     ms_write: f64,
+    /// `UpdateHeader.host_unix_ms` stamped when this part was encoded (before TCP).
+    host_unix_ms: u64,
 }
 
 /// If several damage rects are far apart, their merged bounding box is huge — EPDC refresh then costs
 /// almost as much as a full screen. Split into separate updates when merged area ≫ sum of rect areas.
 const SPARSE_MERGE_AREA_FACTOR: u64 = 3;
-const MAX_SPARSE_SPLIT_PARTS: usize = 16;
+/// Merge many small dirty rects into at most `max_parts` capture bboxes (sort by `(y,x)`, slice, bbox each slice).
+fn cluster_clip_rects_to_bboxes(clipped: Vec<(u32, u32, u32, u32)>, max_parts: usize) -> Vec<(u32, u32, u32, u32)> {
+    let k = max_parts.min(clipped.len()).max(1);
+    let mut items = clipped;
+    items.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+    let n = items.len();
+    let mut out = Vec::with_capacity(k);
+    let base = n / k;
+    let rem = n % k;
+    let mut idx = 0usize;
+    for part_i in 0..k {
+        let take = base + usize::from(part_i < rem);
+        if take == 0 {
+            continue;
+        }
+        let chunk = &items[idx..idx + take];
+        idx += take;
+        let mut x0 = u32::MAX;
+        let mut y0 = u32::MAX;
+        let mut x1 = 0u32;
+        let mut y1 = 0u32;
+        for (rx, ry, rw, rh) in chunk {
+            x0 = x0.min(*rx);
+            y0 = y0.min(*ry);
+            x1 = x1.max(rx + rw);
+            y1 = y1.max(ry + rh);
+        }
+        if x0 < x1 && y0 < y1 {
+            out.push((x0, y0, x1, y1));
+        }
+    }
+    out
+}
 
-fn plan_sparse_capture_bboxes(regions: &[DetectedRegion], w: u32, h: u32) -> Vec<(u32, u32, u32, u32)> {
+fn plan_sparse_capture_bboxes(
+    regions: &[DetectedRegion],
+    w: u32,
+    h: u32,
+    max_split_parts: usize,
+) -> Vec<(u32, u32, u32, u32)> {
     let mut clipped: Vec<(u32, u32, u32, u32)> = Vec::new();
     for r in regions {
         let (rx, ry, rw, rh) = clip_region(*r, w, h);
@@ -856,19 +1188,23 @@ fn plan_sparse_capture_bboxes(regions: &[DetectedRegion], w: u32, h: u32) -> Vec
     let sparse =
         clipped.len() > 1 && merged_area > sum_area.saturating_mul(SPARSE_MERGE_AREA_FACTOR);
 
-    if !sparse || clipped.len() > MAX_SPARSE_SPLIT_PARTS {
+    if !sparse || max_split_parts <= 1 {
         return vec![(mx0, my0, mx1, my1)];
     }
 
-    let mut v: Vec<(u32, u32, u32, u32, u64)> = clipped
-        .into_iter()
-        .map(|(rx, ry, rw, rh)| {
-            let area = rw as u64 * rh as u64;
-            (rx, ry, rx + rw, ry + rh, area)
-        })
-        .collect();
-    v.sort_by_key(|e| e.4);
-    v.into_iter().map(|(a, b, c, d, _)| (a, b, c, d)).collect()
+    if clipped.len() <= max_split_parts {
+        let mut v: Vec<(u32, u32, u32, u32, u64)> = clipped
+            .into_iter()
+            .map(|(rx, ry, rw, rh)| {
+                let area = rw as u64 * rh as u64;
+                (rx, ry, rx + rw, ry + rh, area)
+            })
+            .collect();
+        v.sort_by_key(|e| e.4);
+        return v.into_iter().map(|(a, b, c, d, _)| (a, b, c, d)).collect();
+    }
+
+    cluster_clip_rects_to_bboxes(clipped, max_split_parts)
 }
 
 /// One capture-space bbox → wire buffer (`ms_write` filled by caller).
@@ -882,15 +1218,18 @@ fn encode_capture_bbox(
     y0: u32,
     x1: u32,
     y1: u32,
+    batch_id: u32,
+    part_index: u16,
+    part_count: u16,
     region_rects: usize,
     sparse_parts: u8,
 ) -> DynResult<Option<(Vec<u8>, StreamSendStats)>> {
     if x0 >= x1 || y0 >= y1 {
         return Ok(None);
     }
-    let mw = ((x1 - x0) as u16) & !1;
+    let mw = (x1 - x0) as u16;
     let mh = (y1 - y0) as u16;
-    if mw < 2 || mh < 1 {
+    if mw < 1 || mh < 1 {
         return Ok(None);
     }
 
@@ -914,7 +1253,7 @@ fn encode_capture_bbox(
     let fb_mh = eh as u16;
 
     let tw_pack = Instant::now();
-    let packed = pack_region_gray4_fb(
+    let packed = pack_region_rgb565_fb(
         data,
         frame.stride,
         frame.format,
@@ -930,6 +1269,7 @@ fn encode_capture_bbox(
     let compressed = lz4_flex::block::compress_prepend_size(&packed);
     let ms_lz4 = elapsed_ms(tw_lz4);
 
+    let host_unix_ms = unix_time_millis();
     let header = UpdateHeader {
         x: fb_ix as u16,
         y: fb_iy as u16,
@@ -937,6 +1277,10 @@ fn encode_capture_bbox(
         height: fb_mh,
         waveform: UPDATE_COORDS_FRAMEBUFFER,
         payload_size: compressed.len() as u32,
+        host_unix_ms,
+        batch_id,
+        part_index,
+        part_count,
     };
 
     let mut wire_buf = Vec::with_capacity(header.to_bytes().len() + compressed.len());
@@ -962,11 +1306,12 @@ fn encode_capture_bbox(
             fb_h: fb_mh,
             region_rects,
             sparse_parts,
-            gray4_bytes: packed.len(),
+            payload_bytes: packed.len(),
             wire_bytes,
             ms_pack,
             ms_lz4,
             ms_write: 0.0,
+            host_unix_ms,
         },
     )))
 }
@@ -976,7 +1321,10 @@ fn encode_frame_workloads(
     damage: &mut DamageDetector,
     frame: &VideoFrame,
     lb: &Letterbox,
-    prefer_portal_damage: bool,
+    batch_id: u32,
+    sparse_parts_max: usize,
+    tight_bgra_scratch: &mut Vec<u8>,
+    logged_stride_pack: &mut bool,
 ) -> DynResult<Vec<(Vec<u8>, StreamSendStats)>> {
     let Some(data_arc) = frame.data() else {
         warn!("DMA-BUF frame skipped (no CPU pixels); disable GPU-only capture in compositor if this repeats");
@@ -987,15 +1335,38 @@ fn encode_frame_workloads(
     let w = frame.width;
     let h = frame.height;
 
-    let regions = regions_for_frame(frame, damage, data, w, h, prefer_portal_damage);
+    let regions = regions_for_frame(
+        frame,
+        damage,
+        data,
+        w,
+        h,
+        tight_bgra_scratch,
+        logged_stride_pack,
+    );
     let region_rects = regions.len();
-    let bboxes = plan_sparse_capture_bboxes(&regions, w, h);
+    let bboxes = plan_sparse_capture_bboxes(&regions, w, h, sparse_parts_max);
     let sparse_parts = u8::try_from(bboxes.len()).unwrap_or(u8::MAX);
+    let part_count = u16::try_from(bboxes.len()).unwrap_or(u16::MAX);
 
     let mut out = Vec::with_capacity(bboxes.len());
-    for (x0, y0, x1, y1) in bboxes {
-        if let Some(pair) =
-            encode_capture_bbox(frame, lb, data, w, h, x0, y0, x1, y1, region_rects, sparse_parts)?
+    for (part_i, (x0, y0, x1, y1)) in bboxes.into_iter().enumerate() {
+        if let Some(pair) = encode_capture_bbox(
+            frame,
+            lb,
+            data,
+            w,
+            h,
+            x0,
+            y0,
+            x1,
+            y1,
+            batch_id,
+            u16::try_from(part_i).unwrap_or(u16::MAX),
+            part_count,
+            region_rects,
+            sparse_parts,
+        )?
         {
             out.push(pair);
         }
@@ -1009,66 +1380,87 @@ fn regions_for_frame(
     data: &[u8],
     w: u32,
     h: u32,
-    prefer_portal_damage: bool,
+    tight_bgra_scratch: &mut Vec<u8>,
+    logged_stride_pack: &mut bool,
 ) -> Vec<DetectedRegion> {
-    if prefer_portal_damage {
-        let from_portal = regions_from_portal_damage_regions(frame, w, h);
-        if !from_portal.is_empty() {
-            return from_portal;
-        }
-        if frame_supports_host_pixel_diff(frame, data) {
-            return damage.detect(data, w, h);
-        }
-        return vec![];
-    }
-
-    if frame_supports_host_pixel_diff(frame, data) {
-        return damage.detect(data, w, h);
-    }
-
-    debug!(
-        "host pixel diff unsupported (format {:?} stride={} len={} for {}×{}); using portal damage only",
-        frame.format,
-        frame.stride,
-        data.len(),
+    let regions = detect_damage_bgra(
+        frame,
+        damage,
+        data,
         w,
-        h
-    );
-    regions_from_portal_damage_regions(frame, w, h)
+        h,
+        tight_bgra_scratch,
+        logged_stride_pack,
+    )
+    .unwrap_or_else(|| {
+        warn!(
+            "cannot run host pixel diff (format={:?} stride={} len={} for {}×{}); no update this frame",
+            frame.format,
+            frame.stride,
+            data.len(),
+            w,
+            h
+        );
+        vec![]
+    });
+
+    regions
 }
 
-/// `DamageDetector` expects a tight `width * height * 4` packed buffer (lamco_pipewire tile diff).
-fn frame_supports_host_pixel_diff(frame: &VideoFrame, data: &[u8]) -> bool {
+/// BGRA/BGRx/RGBA/RGBx only.
+fn detect_damage_bgra(
+    frame: &VideoFrame,
+    damage: &mut DamageDetector,
+    data: &[u8],
+    w: u32,
+    h: u32,
+    tight_bgra_scratch: &mut Vec<u8>,
+    logged_stride_pack: &mut bool,
+) -> Option<Vec<DetectedRegion>> {
+    if !frame_format_is_packed_rgba_family(frame.format) {
+        return None;
+    }
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let stride = frame.stride as usize;
+    let tight_bytes = w_us.checked_mul(h_us)?.checked_mul(4)?;
+    let row = w_us * 4;
+    if stride < row {
+        return None;
+    }
+    let need_data = stride.checked_mul(h_us.saturating_sub(1))?.checked_add(row)?;
+    if data.len() < need_data {
+        return None;
+    }
+
+    if frame.stride == w.saturating_mul(4) && data.len() >= tight_bytes {
+        return Some(damage.detect(&data[..tight_bytes], w, h));
+    }
+
+    tight_bgra_scratch.clear();
+    tight_bgra_scratch.resize(tight_bytes, 0);
+    for y in 0..h_us {
+        let src = y * stride;
+        let dst = y * row;
+        tight_bgra_scratch[dst..dst + row].copy_from_slice(&data[src..src + row]);
+    }
+
+    if !*logged_stride_pack {
+        *logged_stride_pack = true;
+        info!(
+            "host pixel diff: packing stride={} rows to tight {}×{}×4 (compositor stride padding — bbox from real pixels only)",
+            frame.stride, w, h
+        );
+    }
+
+    Some(damage.detect(tight_bgra_scratch.as_slice(), w, h))
+}
+
+fn frame_format_is_packed_rgba_family(format: PixelFormat) -> bool {
     matches!(
-        frame.format,
+        format,
         PixelFormat::BGRA | PixelFormat::BGRx | PixelFormat::RGBA | PixelFormat::RGBx
-    ) && frame.stride == frame.width.saturating_mul(4)
-        && data.len() == (frame.width as usize) * (frame.height as usize) * 4
-}
-
-fn regions_from_portal_damage_regions(frame: &VideoFrame, w: u32, h: u32) -> Vec<DetectedRegion> {
-    let mut from_meta: Vec<DetectedRegion> = frame
-        .damage_regions
-        .iter()
-        .filter(|d| d.is_valid())
-        .map(|d| DetectedRegion {
-            x: d.x.max(0) as u32,
-            y: d.y.max(0) as u32,
-            width: d.width,
-            height: d.height,
-        })
-        .collect();
-
-    if from_meta.is_empty() {
-        return vec![];
-    }
-    from_meta.retain(|r| r.x < w && r.y < h);
-    for r in &mut from_meta {
-        r.width = r.width.min(w.saturating_sub(r.x));
-        r.height = r.height.min(h.saturating_sub(r.y));
-    }
-    from_meta.retain(|r| r.width >= 2 && r.height >= 1);
-    from_meta
+    )
 }
 
 fn clip_region(r: DetectedRegion, w: u32, h: u32) -> (u16, u16, u16, u16) {
@@ -1106,6 +1498,7 @@ fn gray_from_pixel(format: PixelFormat, chunk: &[u8]) -> Option<u8> {
 }
 
 /// Sample capture at framebuffer pixel (screen_x, screen_y) using the same inverse map as the tablet.
+#[inline]
 fn gray_at_fb_pixel(
     data: &[u8],
     stride: u32,
@@ -1114,10 +1507,8 @@ fn gray_at_fb_pixel(
     screen_x: u32,
     screen_y: u32,
 ) -> u8 {
-    let u = (screen_x as f64 + 0.5 - lb.off_x as f64) / lb.scale;
-    let v = (screen_y as f64 + 0.5 - lb.off_y as f64) / lb.scale;
-    let src_ix = u.floor().clamp(0.0, (lb.src_w.saturating_sub(1)) as f64) as u32;
-    let src_iy = v.floor().clamp(0.0, (lb.src_h.saturating_sub(1)) as f64) as u32;
+    let src_ix = lb.src_x_at_fb(screen_x);
+    let src_iy = lb.src_y_at_fb(screen_y);
     let bpp = format.bytes_per_pixel().max(3);
     let stride = stride as usize;
     let row_off = src_iy as usize * stride;
@@ -1127,7 +1518,7 @@ fn gray_at_fb_pixel(
 }
 
 /// Pack a region that already lies in framebuffer space (downsampled from capture on the host).
-fn pack_region_gray4_fb(
+fn pack_region_rgb565_fb(
     data: &[u8],
     stride: u32,
     format: PixelFormat,
@@ -1137,17 +1528,21 @@ fn pack_region_gray4_fb(
     w: u16,
     h: u16,
 ) -> DynResult<Vec<u8>> {
-    let mut out = Vec::with_capacity((w as usize / 2) * h as usize);
+    let mut out = Vec::with_capacity(w as usize * h as usize * 2);
     for row in 0..h {
         let screen_y = fb_iy0 + row as u32;
-        for col in (0..w).step_by(2) {
+        for col in 0..w {
             let screen_x = fb_ix0 + col as u32;
-            let g0 = gray_at_fb_pixel(data, stride, format, lb, screen_x, screen_y);
-            let g1 = gray_at_fb_pixel(data, stride, format, lb, screen_x + 1, screen_y);
-            let n0 = (g0 >> 4) & 0x0f;
-            let n1 = (g1 >> 4) & 0x0f;
-            out.push((n0 << 4) | n1);
+            let gray = gray_at_fb_pixel(data, stride, format, lb, screen_x, screen_y);
+            out.extend_from_slice(&gray8_to_rgb565(gray));
         }
     }
     Ok(out)
+}
+
+#[inline]
+fn gray8_to_rgb565(gray: u8) -> [u8; 2] {
+    let g = gray as u16;
+    let rgb565 = ((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3);
+    rgb565.to_le_bytes()
 }

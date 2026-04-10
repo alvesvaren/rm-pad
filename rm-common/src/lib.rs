@@ -15,5 +15,6 @@ pub mod ssh;
 
 pub use epdc_align::expand_rect_to_epdc_grid;
 pub use protocol::{
-    UpdateHeader, HEADER_SIZE, UPDATE_COORDS_CAPTURE, UPDATE_COORDS_FRAMEBUFFER,
+    unix_time_millis, BatchAck, UpdateHeader, ACK_OK, ACK_SIZE, HEADER_SIZE, UPDATE_COORDS_CAPTURE,
+    UPDATE_COORDS_FRAMEBUFFER,
 };

@@ -1,27 +1,249 @@
-//! Tablet-side receiver: TCP → LZ4 → framebuffer partial updates.
+//! Tablet-side receiver: TCP → LZ4 RGB565 patches → framebuffer partial updates.
 //!
 //! Run as `rm-client-screen [HOST] [PORT] [SRC_W SRC_H]` (defaults `127.0.0.1` `9876`).
 //! SRC_W/SRC_H are the host capture size (e.g. 1920×1200); regions are letterboxed to fit
 //! the device framebuffer. `rm-screen` passes these automatically.
+//!
+//! Defaults follow rmkit `RemarkableFB::perform_redraw` (Harmony / github.com/rmkit-dev/rmkit
+//! `src/rmkit/fb/fb.cpy`): **DU** waveform + **EXP1** dither for fast partials.
+//! For slower, higher-quality grays: `RM_CLIENT_SCREEN_WAVEFORM=gl16_fast` and
+//! `RM_CLIENT_SCREEN_DITHER=passthrough`.
+//!
+//! End-to-end timing: `RM_MIRROR_LATENCY_LOG=1` on **both** PC and tablet, plus
+//! `RUST_LOG=rm_mirror_latency=info` (or `trace`) to see where time goes.
 
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::time::Instant;
-
 use libc::{poll, pollfd, POLLIN};
-use libremarkable::framebuffer::common::{
-    color, dither_mode, display_temp, mxcfb_rect, waveform_mode,
-};
+use libremarkable::framebuffer::common::{dither_mode, display_temp, mxcfb_rect, waveform_mode};
 use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefreshMode};
 use log::{error, info, warn};
 use rm_common::expand_rect_to_epdc_grid;
-use rm_common::protocol::{UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
+use rm_common::protocol::{unix_time_millis, BatchAck, UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const IDLE_MS: i32 = 3000;
+struct ParsedBatch {
+    batch_id: u32,
+    updates: Vec<(UpdateHeader, Vec<u8>)>,
+}
+
+const FBSPY_TYPE_RGB565: u32 = 1;
+const FBSPY_TYPE_RGBA: u32 = 2;
+
+struct FramebufferSpyConfig {
+    address: u64,
+    width: u32,
+    height: u32,
+    pixel_type: u32,
+    bpl: u32,
+    requires_reload: bool,
+}
+
+enum PatchWriter {
+    Libremarkable,
+    XochitlMem(XochitlMemFramebuffer),
+}
+
+struct XochitlMemFramebuffer {
+    mem: File,
+    config: FramebufferSpyConfig,
+}
+
+impl FramebufferSpyConfig {
+    fn parse(raw: &str) -> DynResult<Self> {
+        let trimmed = raw.trim();
+        let mut parts = trimmed.split(',');
+        let address = parts.next().ok_or("missing framebuffer address")?;
+        let width = parts.next().ok_or("missing framebuffer width")?.parse()?;
+        let height = parts.next().ok_or("missing framebuffer height")?.parse()?;
+        let pixel_type = parts.next().ok_or("missing framebuffer type")?.parse()?;
+        let bpl = parts.next().ok_or("missing framebuffer bpl")?.parse()?;
+        let requires_reload = match parts.next().ok_or("missing framebuffer reload flag")? {
+            "0" => false,
+            "1" => true,
+            _ => return Err("invalid framebuffer reload flag".into()),
+        };
+        if parts.next().is_some() {
+            return Err("unexpected extra framebuffer config fields".into());
+        }
+        let address = address
+            .strip_prefix("0x")
+            .ok_or("framebuffer address missing 0x prefix")?;
+        Ok(Self {
+            address: u64::from_str_radix(address, 16)?,
+            width,
+            height,
+            pixel_type,
+            bpl,
+            requires_reload,
+        })
+    }
+
+    fn bytes_per_pixel(&self) -> DynResult<usize> {
+        match self.pixel_type {
+            FBSPY_TYPE_RGB565 => Ok(2),
+            FBSPY_TYPE_RGBA => Ok(4),
+            _ => Err(format!("unsupported framebuffer-spy pixel type {}", self.pixel_type).into()),
+        }
+    }
+
+    fn pixel_type_name(&self) -> &'static str {
+        match self.pixel_type {
+            FBSPY_TYPE_RGB565 => "RGB565",
+            FBSPY_TYPE_RGBA => "RGBA/BGRA8888",
+            _ => "unknown",
+        }
+    }
+}
+
+impl PatchWriter {
+    fn discover(fb_w: u32, fb_h: u32) -> DynResult<Self> {
+        let mode = std::env::var("RM_CLIENT_SCREEN_FB_BACKEND")
+            .unwrap_or_else(|_| "libremarkable".to_string());
+        match mode.as_str() {
+            "libremarkable" => {
+                info!("framebuffer pixel backend: libremarkable restore_region");
+                Ok(Self::Libremarkable)
+            }
+            "fbspy" | "auto" => match XochitlMemFramebuffer::discover(fb_w, fb_h) {
+                Ok(writer) => Ok(Self::XochitlMem(writer)),
+                Err(err) => {
+                    warn!(
+                        "framebuffer-spy backend unavailable ({err}); falling back to libremarkable restore_region"
+                    );
+                    Ok(Self::Libremarkable)
+                }
+            },
+            other => Err(format!(
+                "unsupported RM_CLIENT_SCREEN_FB_BACKEND={other} (expected fbspy|auto|libremarkable)"
+            )
+            .into()),
+        }
+    }
+}
+
+impl XochitlMemFramebuffer {
+    fn discover(fb_w: u32, fb_h: u32) -> DynResult<Self> {
+        let config = FramebufferSpyConfig::parse(&query_framebuffer_spy_config_string()?)?;
+        let xochitl_pid = find_xochitl_pid()?;
+        let mem = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{xochitl_pid}/mem"))?;
+        if config.width != fb_w || config.height != fb_h {
+            warn!(
+                "framebuffer-spy geometry {}×{} differs from libremarkable {}×{}; using framebuffer-spy rows for writes",
+                config.width, config.height, fb_w, fb_h
+            );
+        }
+        if config.requires_reload {
+            warn!(
+                "framebuffer-spy requested reload-before-access; continuing anyway (expected false on RM2/qtfb paths)"
+            );
+        }
+        info!(
+            "framebuffer pixel backend: framebuffer-spy via /proc/{xochitl_pid}/mem addr=0x{:x} size={}×{} stride={} format={}",
+            config.address,
+            config.width,
+            config.height,
+            config.bpl,
+            config.pixel_type_name()
+        );
+        Ok(Self { mem, config })
+    }
+
+    fn read_region_rgb565(&self, rect: mxcfb_rect) -> DynResult<Vec<u8>> {
+        let row_out = rect.width as usize * 2;
+        let mut out = vec![0u8; row_out * rect.height as usize];
+        let bytes_per_pixel = self.config.bytes_per_pixel()?;
+        let row_in = rect.width as usize * bytes_per_pixel;
+        let mut row_buf = vec![0u8; row_in];
+        for row in 0..rect.height as usize {
+            let offset = self.byte_offset(rect.left, rect.top + row as u32)?;
+            self.mem.read_exact_at(&mut row_buf, offset)?;
+            match self.config.pixel_type {
+                FBSPY_TYPE_RGB565 => {
+                    out[row * row_out..(row + 1) * row_out].copy_from_slice(&row_buf);
+                }
+                FBSPY_TYPE_RGBA => {
+                    for col in 0..rect.width as usize {
+                        let src = col * 4;
+                        let dst = row * row_out + col * 2;
+                        let b = row_buf[src];
+                        let g = row_buf[src + 1];
+                        let r = row_buf[src + 2];
+                        let pixel = rgb888_to_rgb565(r, g, b).to_le_bytes();
+                        out[dst] = pixel[0];
+                        out[dst + 1] = pixel[1];
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_region_rgb565(&mut self, rect: mxcfb_rect, patch: &[u8]) -> DynResult<()> {
+        let row_in = rect.width as usize * 2;
+        if patch.len() != row_in * rect.height as usize {
+            return Err("patch length does not match xochitl mem rect".into());
+        }
+        let bytes_per_pixel = self.config.bytes_per_pixel()?;
+        let row_out = rect.width as usize * bytes_per_pixel;
+        let mut row_buf = vec![0u8; row_out];
+        for row in 0..rect.height as usize {
+            let src = &patch[row * row_in..(row + 1) * row_in];
+            match self.config.pixel_type {
+                FBSPY_TYPE_RGB565 => row_buf.copy_from_slice(src),
+                FBSPY_TYPE_RGBA => {
+                    for col in 0..rect.width as usize {
+                        let src_px = col * 2;
+                        let dst_px = col * 4;
+                        let px = u16::from_le_bytes([src[src_px], src[src_px + 1]]);
+                        let (r, g, b) = rgb565_to_rgb888(px);
+                        row_buf[dst_px] = b;
+                        row_buf[dst_px + 1] = g;
+                        row_buf[dst_px + 2] = r;
+                        row_buf[dst_px + 3] = 0xFF;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let offset = self.byte_offset(rect.left, rect.top + row as u32)?;
+            self.mem.write_all_at(&row_buf, offset)?;
+        }
+        Ok(())
+    }
+
+    fn byte_offset(&self, left: u32, top: u32) -> DynResult<u64> {
+        if left >= self.config.width || top >= self.config.height {
+            return Err("framebuffer-spy write outside bounds".into());
+        }
+        let bytes_per_pixel = self.config.bytes_per_pixel()? as u64;
+        let offset = self.config.address
+            + top as u64 * self.config.bpl as u64
+            + left as u64 * bytes_per_pixel;
+        Ok(offset)
+    }
+}
+
+fn mirror_latency_log_enabled() -> bool {
+    matches!(
+        std::env::var("RM_MIRROR_LATENCY_LOG").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn ms_between(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1000.0
+}
 
 fn main() -> DynResult<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -48,6 +270,7 @@ fn main() -> DynResult<()> {
     let mut fb = Framebuffer::new();
     let fb_w = fb.var_screen_info.xres;
     let fb_h = fb.var_screen_info.yres;
+    let mut patch_writer = PatchWriter::discover(fb_w, fb_h)?;
 
     let (src_w, src_h) = match source_dims {
         Some((w, h)) if w > 0 && h > 0 => (w, h),
@@ -77,8 +300,10 @@ fn main() -> DynResult<()> {
     );
 
     // Native pen ink uses async-style updates; `Wait` adds ~1 EPDC frame time per mirror patch.
-    // With host-side single-flight TCP, Async is usually best. Use RM_CLIENT_SCREEN_WAIT_REFRESH=1
-    // if you see ghosting or runaway EPDC queues.
+    // With host-side windowed batches, Async is usually best. We default to early ACK after the full
+    // batch has been written to the framebuffer, before `partial_refresh`, so the PC can move on while
+    // the EPDC drains in the background.
+    // RM_CLIENT_SCREEN_WAIT_REFRESH=1 if you see ghosting; RM_CLIENT_SCREEN_EARLY_ACK=0 if tearing.
     let refresh_mode = match std::env::var("RM_CLIENT_SCREEN_WAIT_REFRESH").as_deref() {
         Ok("1") => {
             info!("RM_CLIENT_SCREEN_WAIT_REFRESH=1 — block until EPDC accepts update (slower, steadier)");
@@ -88,17 +313,36 @@ fn main() -> DynResult<()> {
     };
 
     let waveform = waveform_from_env();
+    let dither = dither_from_env();
     let refresh_label = if matches!(refresh_mode, PartialRefreshMode::Wait) {
         "Wait"
     } else {
         "Async"
     };
     info!(
-        "EPDC refresh={} waveform={:?} (RM_CLIENT_SCREEN_WAVEFORM=gc16_fast|gl16_fast|reagl|gc16|du)",
-        refresh_label, waveform
+        "EPDC refresh={} waveform={:?} dither={:?} (WAVEFORM=du|gl16_fast|… DITHER=exp1|passthrough|drawing)",
+        refresh_label, waveform, dither
     );
 
+    // Default on for Async: otherwise the host waits for the whole batch only after the last
+    // `partial_refresh`, which puts EPDC latency directly back into the send window.
+    let early_ack = matches!(refresh_mode, PartialRefreshMode::Async)
+        && !matches!(std::env::var("RM_CLIENT_SCREEN_EARLY_ACK").as_deref(), Ok("0"));
+    if early_ack {
+        info!(
+            "early ACK after batch FB writes, before partial_refresh (set RM_CLIENT_SCREEN_EARLY_ACK=0 to ACK after EPDC; slower host loop)"
+        );
+    } else if matches!(refresh_mode, PartialRefreshMode::Async) {
+        info!("RM_CLIENT_SCREEN_EARLY_ACK=0 — ACK after partial_refresh (slower; steadier if you see tearing)");
+    }
+
+    let latency_log = mirror_latency_log_enabled();
+    if latency_log {
+        info!("RM_MIRROR_LATENCY_LOG=1 — also set RUST_LOG=rm_mirror_latency=info (tablet) and run rm-screen with --latency-log (PC)");
+    }
+
     run_stream(
+        &mut patch_writer,
         &mut fb,
         &mut stream,
         fb_w,
@@ -108,6 +352,9 @@ fn main() -> DynResult<()> {
         off_y,
         refresh_mode,
         waveform,
+        dither,
+        early_ack,
+        latency_log,
     )?;
 
     Ok(())
@@ -139,6 +386,7 @@ fn parse_args() -> DynResult<(String, Option<(u32, u32)>)> {
 }
 
 fn run_stream(
+    patch_writer: &mut PatchWriter,
     fb: &mut Framebuffer,
     stream: &mut TcpStream,
     fb_w: u32,
@@ -148,14 +396,16 @@ fn run_stream(
     off_y: u32,
     refresh_mode: PartialRefreshMode,
     waveform: waveform_mode,
+    dither: dither_mode,
+    early_ack: bool,
+    latency_log: bool,
 ) -> DynResult<()> {
     let fd = stream.as_raw_fd();
     let mut buf: Vec<u8> = Vec::new();
-    let mut last_data = Instant::now();
     let mut updates_ok: u64 = 0;
 
     loop {
-        ensure_min_bytes(stream, fd, &mut buf, HEADER_SIZE, &mut last_data, fb)?;
+        ensure_min_bytes(stream, fd, &mut buf, HEADER_SIZE)?;
         if buf.is_empty() {
             break;
         }
@@ -163,34 +413,53 @@ fn run_stream(
         // Greedily read all available data so we can skip stale updates.
         drain_available(stream, &mut buf);
 
-        let updates = parse_complete_updates(&mut buf);
-        if updates.is_empty() {
+        let mut batches = parse_complete_batches(&mut buf);
+        if batches.is_empty() {
             continue;
         }
+        if batches.len() > 1 {
+            let dropped = batches.len() - 1;
+            for stale in batches.drain(..dropped) {
+                info!(
+                    "dropping stale batch {} ({} parts already superseded by newer data)",
+                    stale.batch_id,
+                    stale.updates.len()
+                );
+                send_batch_ack(stream, stale.batch_id);
+            }
+        }
+        let batch = batches.pop().unwrap();
+        let t_batch = Instant::now();
+        let first_host_unix_ms = batch
+            .updates
+            .first()
+            .map(|(header, _)| header.host_unix_ms)
+            .unwrap_or(0);
+        let mut batch_lz4_ms = 0.0;
+        let mut batch_fb_write_ms = 0.0;
+        let mut refresh_rects: Vec<mxcfb_rect> = Vec::new();
+        let mut batch_parts_ok = 0usize;
 
-        // One ACK per message: the host sends multiple partials per PipeWire frame (sparse
-        // damage). TCP may deliver several complete packets in one read — we must apply each in
-        // order; keeping only the last would drop tiles and stall the host.
-        for (header, payload) in updates {
+        for (header, payload) in batch.updates {
+            let t_msg = Instant::now();
             let raw = match lz4_flex::block::decompress_size_prepended(&payload) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("LZ4 error: {e}");
-                    send_ack(stream);
                     continue;
                 }
             };
+            let t_after_lz4 = Instant::now();
+            batch_lz4_ms += ms_between(t_msg, t_after_lz4);
 
             let w = header.width as u32;
             let h = header.height as u32;
-            let expected = (w / 2) * h;
+            let expected = w * h * 2;
             if raw.len() != expected as usize {
                 warn!("payload mismatch: {} vs {} for {}×{}", raw.len(), expected, w, h);
-                send_ack(stream);
                 continue;
             }
 
-            let rgb565 = expand_gray4_packed(&raw, w, h);
             let mapped = if header.waveform == UPDATE_COORDS_FRAMEBUFFER {
                 let rect = mxcfb_rect {
                     top: header.y as u32,
@@ -201,45 +470,77 @@ fn run_stream(
                 if rect.width < 2 || rect.height < 1 {
                     None
                 } else {
-                    Some((rect, rgb565))
+                    Some((rect, raw))
                 }
             } else {
                 map_region_rgb565_to_fb(
-                    &rgb565, w, h, header.x as u32, header.y as u32,
+                    &raw, w, h, header.x as u32, header.y as u32,
                     scale, off_x, off_y, fb_w, fb_h,
                 )
             };
             if let Some((rect, patch)) = mapped {
-                if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
-                    error!("fb write {:?}: {e}", rect);
-                } else {
-                    let al = expand_to_8px_grid(rect, fb_w, fb_h);
-                    let mode = match refresh_mode {
-                        PartialRefreshMode::Async => PartialRefreshMode::Async,
-                        PartialRefreshMode::Wait => PartialRefreshMode::Wait,
-                        PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
-                    };
-                    fb.partial_refresh(
-                        &al,
-                        mode,
-                        waveform,
-                        display_temp::TEMP_USE_REMARKABLE_DRAW,
-                        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-                        0,
-                        false,
-                    );
-
-                    updates_ok += 1;
-                    if updates_ok <= 3 {
-                        info!(
-                            "update #{updates_ok}: refresh {}×{}@({},{})",
-                            al.width, al.height, al.left, al.top,
-                        );
+                match write_patch_to_fb(patch_writer, fb, rect, &patch, fb_w, fb_h) {
+                    Ok(()) => {
+                        let t_after_fb_write = Instant::now();
+                        batch_fb_write_ms += ms_between(t_after_lz4, t_after_fb_write);
+                        refresh_rects.push(expand_to_8px_grid(rect, fb_w, fb_h));
+                        batch_parts_ok += 1;
+                        updates_ok += 1;
+                        if updates_ok <= 3 {
+                            info!(
+                                "update #{updates_ok}: queued {}×{}@({},{}) in batch {}",
+                                rect.width, rect.height, rect.left, rect.top, header.batch_id,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("fb write {:?}: {e}", rect);
                     }
                 }
             }
-
-            send_ack(stream);
+        }
+        if early_ack {
+            send_batch_ack(stream, batch.batch_id);
+        }
+        let t_before_epdc = Instant::now();
+        for rect in &refresh_rects {
+            fb.partial_refresh(
+                rect,
+                match refresh_mode {
+                    PartialRefreshMode::Async => PartialRefreshMode::Async,
+                    PartialRefreshMode::Wait => PartialRefreshMode::Wait,
+                    PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
+                },
+                waveform,
+                display_temp::TEMP_USE_REMARKABLE_DRAW,
+                dither,
+                0,
+                false,
+            );
+        }
+        let t_after_epdc = Instant::now();
+        if !early_ack {
+            send_batch_ack(stream, batch.batch_id);
+        }
+        if latency_log {
+            let client_wall_ms = unix_time_millis();
+            let wall_skew_ms = client_wall_ms as i128 - first_host_unix_ms as i128;
+            let batch_total_ms = ms_between(t_batch, t_after_epdc);
+            info!(
+                target: "rm_mirror_latency",
+                "tablet batch id={} parts_ok={} refreshes={} lz4_ms={:.2} fb_write_ms={:.2} epdc_ioctl_ms={:.2} batch_total_ms={:.2} \
+                 wall_now−host_stamp={}ms (±clock skew; large with tiny local stages → delay before host stamped or network) host_stamp_ms={} early_ack={}",
+                batch.batch_id,
+                batch_parts_ok,
+                refresh_rects.len(),
+                batch_lz4_ms,
+                batch_fb_write_ms,
+                ms_between(t_before_epdc, t_after_epdc),
+                batch_total_ms,
+                wall_skew_ms,
+                first_host_unix_ms,
+                early_ack,
+            );
         }
     }
 
@@ -247,37 +548,69 @@ fn run_stream(
     Ok(())
 }
 
-fn send_ack(stream: &mut TcpStream) {
+fn send_batch_ack(stream: &mut TcpStream, batch_id: u32) {
     // Socket is non-blocking; `write_all` returns WouldBlock on a full send buffer and would drop
     // the ACK, so the host blocks on `read_exact` and the tunnel piles up data.
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let _ = stream.write_all(&[0x06]);
+    let _ = stream.write_all(&BatchAck::ok(batch_id).to_bytes());
     let _ = stream.flush();
     let _ = stream.set_nonblocking(true);
 }
 
-/// Parse all complete (header + full payload) updates from the front of `buf`,
-/// draining consumed bytes. Leaves any trailing incomplete data in `buf`.
-fn parse_complete_updates(buf: &mut Vec<u8>) -> Vec<(UpdateHeader, Vec<u8>)> {
+/// Parse all complete batches from the front of `buf`, leaving any trailing incomplete batch bytes.
+fn parse_complete_batches(buf: &mut Vec<u8>) -> Vec<ParsedBatch> {
     let mut results = Vec::new();
     let mut pos = 0;
     loop {
+        let batch_start = pos;
         if pos + HEADER_SIZE > buf.len() {
             break;
         }
         let hdr_slice: [u8; HEADER_SIZE] = buf[pos..pos + HEADER_SIZE].try_into().unwrap();
-        let Some(header) = UpdateHeader::from_bytes(&hdr_slice) else {
+        let Some(first) = UpdateHeader::from_bytes(&hdr_slice) else {
             break;
         };
-        let total = HEADER_SIZE + header.payload_size as usize;
-        if pos + total > buf.len() {
+        if first.part_count == 0 {
             break;
         }
-        let payload = buf[pos + HEADER_SIZE..pos + total].to_vec();
-        results.push((header, payload));
-        pos += total;
+        let mut batch = Vec::with_capacity(first.part_count as usize);
+        let mut expected_part = 0u16;
+        while expected_part < first.part_count {
+            if pos + HEADER_SIZE > buf.len() {
+                pos = batch_start;
+                break;
+            }
+            let hdr_slice: [u8; HEADER_SIZE] = buf[pos..pos + HEADER_SIZE].try_into().unwrap();
+            let Some(header) = UpdateHeader::from_bytes(&hdr_slice) else {
+                pos = batch_start;
+                break;
+            };
+            if header.batch_id != first.batch_id
+                || header.part_count != first.part_count
+                || header.part_index != expected_part
+            {
+                pos = batch_start;
+                break;
+            }
+            let total = HEADER_SIZE + header.payload_size as usize;
+            if pos + total > buf.len() {
+                pos = batch_start;
+                break;
+            }
+            let payload = buf[pos + HEADER_SIZE..pos + total].to_vec();
+            batch.push((header, payload));
+            pos += total;
+            expected_part += 1;
+        }
+        if batch.len() != first.part_count as usize {
+            break;
+        }
+        results.push(ParsedBatch {
+            batch_id: first.batch_id,
+            updates: batch,
+        });
     }
     if pos > 0 {
         buf.drain(..pos);
@@ -304,12 +637,25 @@ fn waveform_from_env() -> waveform_mode {
         Ok(s) if s.eq_ignore_ascii_case("gl16_fast") => waveform_mode::WAVEFORM_MODE_GL16_FAST,
         Ok(s) if s.eq_ignore_ascii_case("reagl") => waveform_mode::WAVEFORM_MODE_REAGL,
         Ok(s) if s.eq_ignore_ascii_case("du") => waveform_mode::WAVEFORM_MODE_DU,
-        _ => waveform_mode::WAVEFORM_MODE_GL16_FAST,
+        // Default DU: same class of updates as rmkit Harmony drawing (fast partials; more ghosting than GL16).
+        _ => waveform_mode::WAVEFORM_MODE_DU,
+    }
+}
+
+fn dither_from_env() -> dither_mode {
+    match std::env::var("RM_CLIENT_SCREEN_DITHER").as_deref() {
+        Ok(s) if s.eq_ignore_ascii_case("passthrough") => {
+            dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH
+        }
+        Ok(s) if s.eq_ignore_ascii_case("drawing") => dither_mode::EPDC_FLAG_USE_DITHERING_DRAWING,
+        // Default EXP1 — rmkit `RemarkableFB::perform_redraw` uses this for routine partials.
+        _ => dither_mode::EPDC_FLAG_EXP1,
     }
 }
 
 /// Write a region patch to the framebuffer without triggering a refresh.
 fn write_patch_to_fb(
+    patch_writer: &mut PatchWriter,
     fb: &mut Framebuffer,
     rect: mxcfb_rect,
     patch: &[u8],
@@ -330,14 +676,27 @@ fn write_patch_to_fb(
         return Ok(());
     }
 
-    // Host pre-aligns to this grid; skip dump_region + merge (saves a full framebuffer read).
-    if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
-    {
-        fb.restore_region(al, patch)?;
-        return Ok(());
-    }
-
-    let mut canvas = fb.dump_region(al)?;
+    let mut canvas = if let PatchWriter::XochitlMem(xochitl_fb) = patch_writer {
+        // Host pre-aligns to this grid; skip a read/merge round-trip when we can write rows directly.
+        if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
+        {
+            xochitl_fb
+                .write_region_rgb565(al, patch)
+                .map_err(|_| "framebuffer-spy write failed")?;
+            return Ok(());
+        }
+        xochitl_fb
+            .read_region_rgb565(al)
+            .map_err(|_| "framebuffer-spy read failed")?
+    } else {
+        // Host pre-aligns to this grid; skip dump_region + merge (saves a full framebuffer read).
+        if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
+        {
+            fb.restore_region(al, patch)?;
+            return Ok(());
+        }
+        fb.dump_region(al)?
+    };
     let row_patch = rect.width as usize * bpp;
     let row_canvas = al.width as usize * bpp;
     let ox = (rect.left.saturating_sub(al.left)) as usize * bpp;
@@ -348,7 +707,16 @@ fn write_patch_to_fb(
         canvas[dst..dst + row_patch].copy_from_slice(&patch[src..src + row_patch]);
     }
 
-    fb.restore_region(al, &canvas)?;
+    match patch_writer {
+        PatchWriter::Libremarkable => {
+            let _ = fb.restore_region(al, &canvas)?;
+        }
+        PatchWriter::XochitlMem(xochitl_fb) => {
+            xochitl_fb
+                .write_region_rgb565(al, &canvas)
+                .map_err(|_| "framebuffer-spy write failed")?;
+        }
+    }
     Ok(())
 }
 
@@ -430,54 +798,153 @@ fn expand_to_8px_grid(rect: mxcfb_rect, fb_w: u32, fb_h: u32) -> mxcfb_rect {
     }
 }
 
+fn rgb565_to_rgb888(px: u16) -> (u8, u8, u8) {
+    let r5 = ((px >> 11) & 0x1f) as u32;
+    let g6 = ((px >> 5) & 0x3f) as u32;
+    let b5 = (px & 0x1f) as u32;
+    (
+        ((r5 * 255) / 31) as u8,
+        ((g6 * 255) / 63) as u8,
+        ((b5 * 255) / 31) as u8,
+    )
+}
+
+fn rgb888_to_rgb565(r: u8, g: u8, b: u8) -> u16 {
+    let r5 = (r as u16 >> 3) & 0x1f;
+    let g6 = (g as u16 >> 2) & 0x3f;
+    let b5 = (b as u16 >> 3) & 0x1f;
+    (r5 << 11) | (g6 << 5) | b5
+}
+
+fn find_xochitl_pid() -> DynResult<u32> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = fs::read_to_string(comm_path) {
+            if comm.trim() == "xochitl" {
+                return Ok(name);
+            }
+        }
+    }
+    Err("xochitl is not running; framebuffer-spy backend needs xochitl alive".into())
+}
+
+fn query_framebuffer_spy_config_string() -> DynResult<String> {
+    if !std::path::Path::new("/run/xovi-mb").exists()
+        || !std::path::Path::new("/run/xovi-mb-out").exists()
+    {
+        return Err("xovi-message-broker pipes are missing".into());
+    }
+
+    let out_path = CString::new("/run/xovi-mb-out")?;
+    let out_fd = unsafe { libc::open(out_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if out_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let in_path = CString::new("/run/xovi-mb")?;
+    let in_fd = unsafe { libc::open(in_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+    if in_fd < 0 {
+        unsafe {
+            libc::close(out_fd);
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let cmd = b">eframebuffer-spy$getConfigString:\n";
+    let written = unsafe { libc::write(in_fd, cmd.as_ptr() as *const libc::c_void, cmd.len()) };
+    unsafe {
+        libc::close(in_fd);
+    }
+    if written != cmd.len() as isize {
+        unsafe {
+            libc::close(out_fd);
+        }
+        return Err("failed to send framebuffer-spy broker request".into());
+    }
+
+    let mut pfd = pollfd {
+        fd: out_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let poll_rc = unsafe { poll(&mut pfd as *mut pollfd, 1, 1000) };
+    if poll_rc <= 0 {
+        unsafe {
+            libc::close(out_fd);
+        }
+        return Err("timed out waiting for framebuffer-spy broker response".into());
+    }
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let read = unsafe { libc::read(out_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                break;
+            }
+            unsafe {
+                libc::close(out_fd);
+            }
+            return Err(err.into());
+        }
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..read as usize]);
+    }
+    unsafe {
+        libc::close(out_fd);
+    }
+
+    if out.is_empty() {
+        return Err("framebuffer-spy broker returned empty config".into());
+    }
+    Ok(String::from_utf8(out)?)
+}
+
 
 fn ensure_min_bytes(
     stream: &mut TcpStream,
     fd: i32,
     buf: &mut Vec<u8>,
     min: usize,
-    last_data: &mut Instant,
-    fb: &mut Framebuffer,
 ) -> DynResult<()> {
     while buf.len() < min {
-        match poll_fd(fd, IDLE_MS)? {
-            PollOutcome::Timeout => {
-                if last_data.elapsed().as_millis() as i32 >= IDLE_MS {
-                    ghost_clear(fb);
-                    *last_data = Instant::now();
-                }
-            }
-            PollOutcome::Ready => {
-                if !read_available(stream, buf)? {
-                    buf.clear();
-                    return Ok(());
-                }
-                *last_data = Instant::now();
-            }
+        poll_until_readable(fd)?;
+        if !read_available(stream, buf)? {
+            buf.clear();
+            return Ok(());
         }
     }
     Ok(())
 }
 
-enum PollOutcome {
-    Ready,
-    Timeout,
-}
-
-fn poll_fd(fd: i32, timeout_ms: i32) -> DynResult<PollOutcome> {
+/// Block until the socket is readable (no periodic wakeup; we do not use full-screen EPDC refresh).
+fn poll_until_readable(fd: i32) -> DynResult<()> {
     let mut pfd = pollfd {
         fd,
         events: POLLIN as i16,
         revents: 0,
     };
-    let r = unsafe { poll(&mut pfd, 1, timeout_ms) };
-    if r < 0 {
-        return Err(std::io::Error::last_os_error().into());
+    loop {
+        let r = unsafe { poll(&mut pfd, 1, -1) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        if r > 0 {
+            return Ok(());
+        }
     }
-    if r == 0 {
-        return Ok(PollOutcome::Timeout);
-    }
-    Ok(PollOutcome::Ready)
 }
 
 fn read_available(stream: &mut TcpStream, buf: &mut Vec<u8>) -> DynResult<bool> {
@@ -496,34 +963,3 @@ fn read_available(stream: &mut TcpStream, buf: &mut Vec<u8>) -> DynResult<bool> 
     }
 }
 
-fn ghost_clear(fb: &mut Framebuffer) {
-    info!("idle ≥3s — full GC16 refresh");
-    let _ = fb.full_refresh(
-        waveform_mode::WAVEFORM_MODE_GC16,
-        display_temp::TEMP_USE_REMARKABLE_DRAW,
-        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-        0,
-        false,
-    );
-}
-
-fn expand_gray4_packed(packed: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((w * h * 2) as usize);
-    let half_w = (w / 2) as usize;
-    for y in 0..h as usize {
-        let row = y * half_w;
-        for x in 0..half_w {
-            let b = packed[row + x];
-            let n0 = (b >> 4) & 0x0f;
-            let n1 = b & 0x0f;
-            out.extend_from_slice(&nibble_gray_rgb565(n0));
-            out.extend_from_slice(&nibble_gray_rgb565(n1));
-        }
-    }
-    out
-}
-
-fn nibble_gray_rgb565(n: u8) -> [u8; 2] {
-    let g = (n & 0x0f) * 17;
-    color::RGB(g, g, g).as_native()
-}
