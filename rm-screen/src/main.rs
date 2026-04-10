@@ -39,6 +39,20 @@ fn elapsed_ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
+/// `DamageConfig::low_bandwidth` uses 32px tiles and very low thresholds. Gradients, video-like
+/// noise, and subpixel text can then mark almost every tile inside a compositor damage tile, so the
+/// merged bbox becomes a huge rectangle (~384×416) even when you only “see” a small change.
+/// Finer tiles and slightly stricter thresholds track visible edits more tightly (more CPU).
+fn damage_config_for_screen_mirror() -> DamageConfig {
+    DamageConfig {
+        tile_size: 16,
+        diff_threshold: 0.055,
+        pixel_threshold: 6,
+        merge_distance: 10,
+        min_region_area: 80,
+    }
+}
+
 /// Block on first `recv`, drain `try_recv`, return freshest frame.
 async fn recv_latest_drained(
     rx: &mut tokio::sync::mpsc::Receiver<VideoFrame>,
@@ -107,6 +121,11 @@ struct ScreenCli {
     /// Log every main-loop iteration (including waits with no dirty region). Very noisy.
     #[arg(long)]
     stream_trace: bool,
+
+    /// Use PipeWire / compositor damage rectangles when present (often coarse tiles, not actual pixels).
+    /// Default is host-side pixel diff for tight BGRx buffers — matches real on-screen changes.
+    #[arg(long, env = "RM_SCREEN_PREFER_PORTAL_DAMAGE")]
+    prefer_portal_damage: bool,
 }
 
 #[tokio::main]
@@ -225,6 +244,7 @@ async fn main() -> DynResult<()> {
     let raw_fd = pw_fd.into_raw_fd();
     let mut stream_config = StreamConfig::new(format!("{}-0", pw_config.stream_name_prefix))
         .with_resolution(stream_info.size.0, stream_info.size.1)
+        .with_framerate(60)
         .with_dmabuf(pw_config.use_dmabuf)
         .with_buffer_count(pw_config.buffer_count);
     stream_config.preferred_format = pw_config.preferred_format;
@@ -409,7 +429,7 @@ async fn main() -> DynResult<()> {
     ));
 
     let mut sock = sock;
-    let mut damage = DamageDetector::new(DamageConfig::low_bandwidth());
+    let mut damage = DamageDetector::new(damage_config_for_screen_mirror());
     // Portal `stream_info.size` can disagree with actual PipeWire `VideoFrame` dimensions; scaling
     // and `gray_at_fb_pixel` must use the frame buffer size we read from.
     let mut lb = Letterbox::new(stream_info.size.0, stream_info.size.1, fb_w, fb_h);
@@ -427,6 +447,16 @@ async fn main() -> DynResult<()> {
         "rm-screen stream log: one INFO line per update (ACK runs in parallel with fetching the next frame). \
          Use --stream-trace for iterations with no dirty region."
     );
+    if screen_cli.prefer_portal_damage {
+        info!(
+            "dirty regions: using portal/compositor damage when present (may be oversized — set RM_SCREEN_PREFER_PORTAL_DAMAGE=0 to use pixel diff)"
+        );
+    } else {
+        info!(
+            "dirty regions: host pixel diff (real changes) for tight BGRx/BGRA buffers; \
+             portal rectangles only as fallback; --prefer-portal-damage for compositor tiles only"
+        );
+    }
 
     let mut frame_count: u64 = 0;
     let mut frames_dropped: u64 = 0;
@@ -445,7 +475,7 @@ async fn main() -> DynResult<()> {
         };
     frames_dropped += prev_channel_skipped;
 
-    loop {
+    'stream: loop {
         let tw_cycle = Instant::now();
         let skipped = prev_channel_skipped;
         let ms_recv_wait = prev_recv_ms;
@@ -494,7 +524,12 @@ async fn main() -> DynResult<()> {
             );
         }
 
-        let encode_out = match encode_update(&mut damage, &latest, &lb) {
+        let encode_workloads = match encode_frame_workloads(
+            &mut damage,
+            &latest,
+            &lb,
+            screen_cli.prefer_portal_damage,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 error!("stream error: {e}");
@@ -503,103 +538,129 @@ async fn main() -> DynResult<()> {
             }
         };
 
-        if let Some((wire_buf, mut stats)) = encode_out {
-            stream_seq += 1;
+        if !encode_workloads.is_empty() {
+            let n_parts = encode_workloads.len();
+            for (part_i, (wire_buf, mut stats)) in encode_workloads.into_iter().enumerate() {
+                let is_last_part = part_i + 1 == n_parts;
+                stream_seq += 1;
 
-            let tw_write = Instant::now();
-            if let Err(e) = sock.write_all(&wire_buf) {
-                error!("TCP write failed: {e}");
-                info!("stopped after {frame_count} frames sent");
-                break;
-            }
-            if let Err(e) = sock.flush() {
-                error!("TCP flush failed: {e}");
-                break;
-            }
-            stats.ms_write = elapsed_ms(tw_write);
-
-            let sock_r = sock_read.clone();
-            let ack_task = tokio::task::spawn_blocking(move || {
-                let mut guard = sock_r
-                    .lock()
-                    .map_err(|e| format!("ACK lock poisoned: {e}"))?;
-                let t_ack = Instant::now();
-                let mut ack = [0u8; 1];
-                guard
-                    .read_exact(&mut ack)
-                    .map_err(|e| format!("ACK read: {e}"))?;
-                Ok::<_, String>((ack[0], elapsed_ms(t_ack)))
-            });
-
-            let recv_task = recv_latest_drained(&mut frame_rx);
-
-            let (ack_join, recv_out) = tokio::join!(ack_task, recv_task);
-
-            let (ack_byte, ms_ack) = match ack_join {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    error!("ACK task failed: {e}");
-                    break;
+                let tw_write = Instant::now();
+                if let Err(e) = sock.write_all(&wire_buf) {
+                    error!("TCP write failed: {e}");
+                    info!("stopped after {frame_count} frames sent");
+                    break 'stream;
                 }
-                Err(e) => {
-                    error!("ACK join failed: {e}");
-                    break;
+                if let Err(e) = sock.flush() {
+                    error!("TCP flush failed: {e}");
+                    break 'stream;
                 }
-            };
+                stats.ms_write = elapsed_ms(tw_write);
 
-            match recv_out {
-                None => {
-                    info!("frame pipeline ended after {frame_count} iterations, {frames_dropped} dropped (sender closed)");
-                    break;
-                }
-                Some((next_latest, ch_sk, ms_recv_parallel)) => {
-                    latest = next_latest;
-                    prev_channel_skipped = ch_sk;
-                    prev_recv_ms = ms_recv_parallel;
-                    frames_dropped += ch_sk;
-                }
-            }
+                let sock_r = sock_read.clone();
+                let ack_task = tokio::task::spawn_blocking(move || {
+                    let mut guard = sock_r
+                        .lock()
+                        .map_err(|e| format!("ACK lock poisoned: {e}"))?;
+                    let t_ack = Instant::now();
+                    let mut ack = [0u8; 1];
+                    guard
+                        .read_exact(&mut ack)
+                        .map_err(|e| format!("ACK read: {e}"))?;
+                    Ok::<_, String>((ack[0], elapsed_ms(t_ack)))
+                });
 
-            if ack_byte != 0x06 {
-                warn!(
-                    "rm-screen stream seq={stream_seq} unexpected ACK byte 0x{:02x} (expected 0x06)",
-                    ack_byte
+                let (ack_byte, ms_ack) = if is_last_part {
+                    let recv_task = recv_latest_drained(&mut frame_rx);
+                    let (ack_join, recv_out) = tokio::join!(ack_task, recv_task);
+
+                    let ack_pair = match ack_join {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            error!("ACK task failed: {e}");
+                            break 'stream;
+                        }
+                        Err(e) => {
+                            error!("ACK join failed: {e}");
+                            break 'stream;
+                        }
+                    };
+
+                    match recv_out {
+                        None => {
+                            info!("frame pipeline ended after {frame_count} iterations, {frames_dropped} dropped (sender closed)");
+                            break 'stream;
+                        }
+                        Some((next_latest, ch_sk, ms_recv_parallel)) => {
+                            latest = next_latest;
+                            prev_channel_skipped = ch_sk;
+                            prev_recv_ms = ms_recv_parallel;
+                            frames_dropped += ch_sk;
+                        }
+                    }
+                    ack_pair
+                } else {
+                    match ack_task.await {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            error!("ACK task failed: {e}");
+                            break 'stream;
+                        }
+                        Err(e) => {
+                            error!("ACK join failed: {e}");
+                            break 'stream;
+                        }
+                    }
+                };
+
+                if ack_byte != 0x06 {
+                    warn!(
+                        "rm-screen stream seq={stream_seq} unexpected ACK byte 0x{:02x} (expected 0x06)",
+                        ack_byte
+                    );
+                }
+                if ms_ack >= 1500.0 {
+                    warn!(
+                        "rm-screen stream seq={stream_seq} ACK slow: ack_wait_ms={ms_ack:.1} (tablet / tunnel / EPDC?)",
+                    );
+                }
+
+                let full_iter_ms = elapsed_ms(tw_cycle);
+                info!(
+                    "rm-screen stream seq={} part={}/{} full_iter_ms={:.2} recv_ms={:.1} drain_try_ms={:.1} channel_dropped={} \
+                     capture={}×{}@({},{}) fb={}×{}@({},{}) regions={} sparse_parts={} \
+                     pack_ms={:.2} lz4_ms={:.2} write_ms={:.2} gray4_B={} wire_B={} \
+                     ack_byte=0x{:02x} ack_wait_ms={:.2} {}",
+                    stream_seq,
+                    part_i + 1,
+                    n_parts,
+                    full_iter_ms,
+                    ms_recv_wait,
+                    ms_drain_spin,
+                    skipped,
+                    stats.capture_w,
+                    stats.capture_h,
+                    stats.capture_x0,
+                    stats.capture_y0,
+                    stats.fb_w,
+                    stats.fb_h,
+                    stats.fb_x,
+                    stats.fb_y,
+                    stats.region_rects,
+                    stats.sparse_parts,
+                    stats.ms_pack,
+                    stats.ms_lz4,
+                    stats.ms_write,
+                    stats.gray4_bytes,
+                    stats.wire_bytes,
+                    ack_byte,
+                    ms_ack,
+                    if is_last_part {
+                        "(recv overlapped w/ ACK on last part)"
+                    } else {
+                        ""
+                    },
                 );
             }
-            if ms_ack >= 1500.0 {
-                warn!(
-                    "rm-screen stream seq={stream_seq} ACK slow: ack_wait_ms={ms_ack:.1} (tablet / tunnel / EPDC?)",
-                );
-            }
-
-            let full_iter_ms = elapsed_ms(tw_cycle);
-            info!(
-                "rm-screen stream seq={} full_iter_ms={:.2} recv_ms={:.1} drain_try_ms={:.1} channel_dropped={} \
-                 capture={}×{}@({},{}) fb={}×{}@({},{}) regions={} \
-                 pack_ms={:.2} lz4_ms={:.2} write_ms={:.2} gray4_B={} wire_B={} \
-                 ack_byte=0x{:02x} ack_wait_ms={:.2} (recv overlapped w/ ACK)",
-                stream_seq,
-                full_iter_ms,
-                ms_recv_wait,
-                ms_drain_spin,
-                skipped,
-                stats.capture_w,
-                stats.capture_h,
-                stats.capture_x0,
-                stats.capture_y0,
-                stats.fb_w,
-                stats.fb_h,
-                stats.fb_x,
-                stats.fb_y,
-                stats.region_rects,
-                stats.ms_pack,
-                stats.ms_lz4,
-                stats.ms_write,
-                stats.gray4_bytes,
-                stats.wire_bytes,
-                ack_byte,
-                ms_ack,
-            );
         } else {
             if screen_cli.stream_trace {
                 info!(
@@ -745,6 +806,8 @@ struct StreamSendStats {
     fb_w: u16,
     fb_h: u16,
     region_rects: usize,
+    /// Same PipeWire frame split into N TCP updates (1 = single merged rect).
+    sparse_parts: u8,
     gray4_bytes: usize,
     wire_bytes: usize,
     ms_pack: f64,
@@ -752,40 +815,75 @@ struct StreamSendStats {
     ms_write: f64,
 }
 
-/// Merge all dirty regions into a single bounding-box update.
-/// Returns wire buffer + stats (`ms_write` filled in by caller after `write_all`).
-fn encode_update(
-    damage: &mut DamageDetector,
-    frame: &VideoFrame,
-    lb: &Letterbox,
-) -> DynResult<Option<(Vec<u8>, StreamSendStats)>> {
-    let Some(data_arc) = frame.data() else {
-        warn!("DMA-BUF frame skipped (no CPU pixels); disable GPU-only capture in compositor if this repeats");
-        damage.invalidate();
-        return Ok(None);
-    };
-    let data = data_arc.as_slice();
-    let w = frame.width;
-    let h = frame.height;
+/// If several damage rects are far apart, their merged bounding box is huge — EPDC refresh then costs
+/// almost as much as a full screen. Split into separate updates when merged area ≫ sum of rect areas.
+const SPARSE_MERGE_AREA_FACTOR: u64 = 3;
+const MAX_SPARSE_SPLIT_PARTS: usize = 16;
 
-    let regions = regions_for_frame(frame, damage, data, w, h);
-    let region_rects = regions.len();
-
-    // Merge all dirty rects into one bounding box.
-    let mut x0 = w;
-    let mut y0 = h;
-    let mut x1 = 0u32;
-    let mut y1 = 0u32;
-    for r in &regions {
+fn plan_sparse_capture_bboxes(regions: &[DetectedRegion], w: u32, h: u32) -> Vec<(u32, u32, u32, u32)> {
+    let mut clipped: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for r in regions {
         let (rx, ry, rw, rh) = clip_region(*r, w, h);
         if rw < 2 || rh < 1 {
             continue;
         }
-        x0 = x0.min(rx as u32);
-        y0 = y0.min(ry as u32);
-        x1 = x1.max(rx as u32 + rw as u32);
-        y1 = y1.max(ry as u32 + rh as u32);
+        clipped.push((rx as u32, ry as u32, rw as u32, rh as u32));
     }
+    if clipped.is_empty() {
+        return vec![];
+    }
+
+    let mut mx0 = w;
+    let mut my0 = h;
+    let mut mx1 = 0u32;
+    let mut my1 = 0u32;
+    for (rx, ry, rw, rh) in &clipped {
+        mx0 = mx0.min(*rx);
+        my0 = my0.min(*ry);
+        mx1 = mx1.max(rx + rw);
+        my1 = my1.max(ry + rh);
+    }
+    if mx0 >= mx1 || my0 >= my1 {
+        return vec![];
+    }
+
+    let sum_area: u64 = clipped
+        .iter()
+        .map(|(_, _, rw, rh)| *rw as u64 * *rh as u64)
+        .sum();
+    let merged_area = (mx1 - mx0) as u64 * (my1 - my0) as u64;
+    let sparse =
+        clipped.len() > 1 && merged_area > sum_area.saturating_mul(SPARSE_MERGE_AREA_FACTOR);
+
+    if !sparse || clipped.len() > MAX_SPARSE_SPLIT_PARTS {
+        return vec![(mx0, my0, mx1, my1)];
+    }
+
+    let mut v: Vec<(u32, u32, u32, u32, u64)> = clipped
+        .into_iter()
+        .map(|(rx, ry, rw, rh)| {
+            let area = rw as u64 * rh as u64;
+            (rx, ry, rx + rw, ry + rh, area)
+        })
+        .collect();
+    v.sort_by_key(|e| e.4);
+    v.into_iter().map(|(a, b, c, d, _)| (a, b, c, d)).collect()
+}
+
+/// One capture-space bbox → wire buffer (`ms_write` filled by caller).
+fn encode_capture_bbox(
+    frame: &VideoFrame,
+    lb: &Letterbox,
+    data: &[u8],
+    w: u32,
+    h: u32,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    region_rects: usize,
+    sparse_parts: u8,
+) -> DynResult<Option<(Vec<u8>, StreamSendStats)>> {
     if x0 >= x1 || y0 >= y1 {
         return Ok(None);
     }
@@ -862,6 +960,7 @@ fn encode_update(
             fb_w: fb_mw,
             fb_h: fb_mh,
             region_rects,
+            sparse_parts,
             gray4_bytes: packed.len(),
             wire_bytes,
             ms_pack,
@@ -871,13 +970,82 @@ fn encode_update(
     )))
 }
 
+/// Dirty regions for the current PipeWire frame → one or more bbox encodes (sparse split when cheap).
+fn encode_frame_workloads(
+    damage: &mut DamageDetector,
+    frame: &VideoFrame,
+    lb: &Letterbox,
+    prefer_portal_damage: bool,
+) -> DynResult<Vec<(Vec<u8>, StreamSendStats)>> {
+    let Some(data_arc) = frame.data() else {
+        warn!("DMA-BUF frame skipped (no CPU pixels); disable GPU-only capture in compositor if this repeats");
+        damage.invalidate();
+        return Ok(vec![]);
+    };
+    let data = data_arc.as_slice();
+    let w = frame.width;
+    let h = frame.height;
+
+    let regions = regions_for_frame(frame, damage, data, w, h, prefer_portal_damage);
+    let region_rects = regions.len();
+    let bboxes = plan_sparse_capture_bboxes(&regions, w, h);
+    let sparse_parts = u8::try_from(bboxes.len()).unwrap_or(u8::MAX);
+
+    let mut out = Vec::with_capacity(bboxes.len());
+    for (x0, y0, x1, y1) in bboxes {
+        if let Some(pair) =
+            encode_capture_bbox(frame, lb, data, w, h, x0, y0, x1, y1, region_rects, sparse_parts)?
+        {
+            out.push(pair);
+        }
+    }
+    Ok(out)
+}
+
 fn regions_for_frame(
     frame: &VideoFrame,
     damage: &mut DamageDetector,
     data: &[u8],
     w: u32,
     h: u32,
+    prefer_portal_damage: bool,
 ) -> Vec<DetectedRegion> {
+    if prefer_portal_damage {
+        let from_portal = regions_from_portal_damage_regions(frame, w, h);
+        if !from_portal.is_empty() {
+            return from_portal;
+        }
+        if frame_supports_host_pixel_diff(frame, data) {
+            return damage.detect(data, w, h);
+        }
+        return vec![];
+    }
+
+    if frame_supports_host_pixel_diff(frame, data) {
+        return damage.detect(data, w, h);
+    }
+
+    debug!(
+        "host pixel diff unsupported (format {:?} stride={} len={} for {}×{}); using portal damage only",
+        frame.format,
+        frame.stride,
+        data.len(),
+        w,
+        h
+    );
+    regions_from_portal_damage_regions(frame, w, h)
+}
+
+/// `DamageDetector` expects a tight `width * height * 4` packed buffer (lamco_pipewire tile diff).
+fn frame_supports_host_pixel_diff(frame: &VideoFrame, data: &[u8]) -> bool {
+    matches!(
+        frame.format,
+        PixelFormat::BGRA | PixelFormat::BGRx | PixelFormat::RGBA | PixelFormat::RGBx
+    ) && frame.stride == frame.width.saturating_mul(4)
+        && data.len() == (frame.width as usize) * (frame.height as usize) * 4
+}
+
+fn regions_from_portal_damage_regions(frame: &VideoFrame, w: u32, h: u32) -> Vec<DetectedRegion> {
     let mut from_meta: Vec<DetectedRegion> = frame
         .damage_regions
         .iter()
@@ -890,19 +1058,16 @@ fn regions_for_frame(
         })
         .collect();
 
-    if !from_meta.is_empty() {
-        from_meta.retain(|r| r.x < w && r.y < h);
-        for r in &mut from_meta {
-            r.width = r.width.min(w.saturating_sub(r.x));
-            r.height = r.height.min(h.saturating_sub(r.y));
-        }
-        from_meta.retain(|r| r.width >= 2 && r.height >= 1);
-        if !from_meta.is_empty() {
-            return from_meta;
-        }
+    if from_meta.is_empty() {
+        return vec![];
     }
-
-    damage.detect(data, w, h)
+    from_meta.retain(|r| r.x < w && r.y < h);
+    for r in &mut from_meta {
+        r.width = r.width.min(w.saturating_sub(r.x));
+        r.height = r.height.min(h.saturating_sub(r.y));
+    }
+    from_meta.retain(|r| r.width >= 2 && r.height >= 1);
+    from_meta
 }
 
 fn clip_region(r: DetectedRegion, w: u32, h: u32) -> (u16, u16, u16, u16) {
