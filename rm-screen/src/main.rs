@@ -20,6 +20,7 @@ use lamco_portal::{PortalConfig, PortalManager};
 use log::{debug, error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
+use rm_common::expand_rect_to_epdc_grid;
 use rm_common::grab;
 use rm_common::protocol::{UpdateHeader, UPDATE_COORDS_FRAMEBUFFER};
 use rm_common::screen_client::{
@@ -799,6 +800,19 @@ fn encode_update(
     let Some((fb_ix, fb_iy, fb_mw, fb_mh)) = lb.capture_bbox_to_fb(x0, y0, cap_x1, cap_y1) else {
         return Ok(None);
     };
+    let (fb_ix, fb_iy, ew, eh) = expand_rect_to_epdc_grid(
+        fb_ix,
+        fb_iy,
+        fb_mw as u32,
+        fb_mh as u32,
+        lb.fb_w,
+        lb.fb_h,
+    );
+    if ew < 2 || eh < 1 {
+        return Ok(None);
+    }
+    let fb_mw = ew as u16;
+    let fb_mh = eh as u16;
 
     let tw_pack = Instant::now();
     let packed = pack_region_gray4_fb(

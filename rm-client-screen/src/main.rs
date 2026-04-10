@@ -16,6 +16,7 @@ use libremarkable::framebuffer::common::{
 use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefreshMode};
 use log::{error, info, warn};
+use rm_common::expand_rect_to_epdc_grid;
 use rm_common::protocol::{UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -75,18 +76,27 @@ fn main() -> DynResult<()> {
         fb.var_screen_info.bits_per_pixel
     );
 
-    // Async returns before the panel finishes; we ACK immediately after, so the PC sends the
-    // next frame while the EPDC queue grows — lag compounds (seconds after ~1 min).  Wait keeps
-    // one refresh in flight, which matches our ACK pacing.
-    let refresh_mode = match std::env::var("RM_CLIENT_SCREEN_ASYNC_REFRESH").as_deref() {
+    // Native pen ink uses async-style updates; `Wait` adds ~1 EPDC frame time per mirror patch.
+    // With host-side single-flight TCP, Async is usually best. Use RM_CLIENT_SCREEN_WAIT_REFRESH=1
+    // if you see ghosting or runaway EPDC queues.
+    let refresh_mode = match std::env::var("RM_CLIENT_SCREEN_WAIT_REFRESH").as_deref() {
         Ok("1") => {
-            info!(
-                "RM_CLIENT_SCREEN_ASYNC_REFRESH=1 — do not wait for EPDC (lower latency *per* refresh if you can drain the queue; often worsens mirror lag)"
-            );
-            PartialRefreshMode::Async
+            info!("RM_CLIENT_SCREEN_WAIT_REFRESH=1 — block until EPDC accepts update (slower, steadier)");
+            PartialRefreshMode::Wait
         }
-        _ => PartialRefreshMode::Wait,
+        _ => PartialRefreshMode::Async,
     };
+
+    let waveform = waveform_from_env();
+    let refresh_label = if matches!(refresh_mode, PartialRefreshMode::Wait) {
+        "Wait"
+    } else {
+        "Async"
+    };
+    info!(
+        "EPDC refresh={} waveform={:?} (RM_CLIENT_SCREEN_WAVEFORM=gc16_fast|gl16_fast|reagl|gc16|du)",
+        refresh_label, waveform
+    );
 
     run_stream(
         &mut fb,
@@ -97,6 +107,7 @@ fn main() -> DynResult<()> {
         off_x,
         off_y,
         refresh_mode,
+        waveform,
     )?;
 
     Ok(())
@@ -136,6 +147,7 @@ fn run_stream(
     off_x: u32,
     off_y: u32,
     refresh_mode: PartialRefreshMode,
+    waveform: waveform_mode,
 ) -> DynResult<()> {
     let fd = stream.as_raw_fd();
     let mut buf: Vec<u8> = Vec::new();
@@ -213,7 +225,7 @@ fn run_stream(
                 fb.partial_refresh(
                     &al,
                     mode,
-                    waveform_mode::WAVEFORM_MODE_GC16_FAST,
+                    waveform,
                     display_temp::TEMP_USE_REMARKABLE_DRAW,
                     dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
                     0,
@@ -288,6 +300,17 @@ fn drain_available(stream: &mut TcpStream, buf: &mut Vec<u8>) {
     }
 }
 
+fn waveform_from_env() -> waveform_mode {
+    match std::env::var("RM_CLIENT_SCREEN_WAVEFORM").as_deref() {
+        Ok(s) if s.eq_ignore_ascii_case("gc16") => waveform_mode::WAVEFORM_MODE_GC16,
+        Ok(s) if s.eq_ignore_ascii_case("gc16_fast") => waveform_mode::WAVEFORM_MODE_GC16_FAST,
+        Ok(s) if s.eq_ignore_ascii_case("gl16_fast") => waveform_mode::WAVEFORM_MODE_GL16_FAST,
+        Ok(s) if s.eq_ignore_ascii_case("reagl") => waveform_mode::WAVEFORM_MODE_REAGL,
+        Ok(s) if s.eq_ignore_ascii_case("du") => waveform_mode::WAVEFORM_MODE_DU,
+        _ => waveform_mode::WAVEFORM_MODE_GL16_FAST,
+    }
+}
+
 /// Write a region patch to the framebuffer without triggering a refresh.
 fn write_patch_to_fb(
     fb: &mut Framebuffer,
@@ -306,7 +329,14 @@ fn write_patch_to_fb(
     }
 
     let al = expand_to_8px_grid(rect, fb_w, fb_h);
-    if al.width < 1 || al.height < 1 {
+    if al.width < 2 || al.height < 1 {
+        return Ok(());
+    }
+
+    // Host pre-aligns to this grid; skip dump_region + merge (saves a full framebuffer read).
+    if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
+    {
+        fb.restore_region(al, patch)?;
         return Ok(());
     }
 
@@ -385,21 +415,21 @@ fn map_region_rgb565_to_fb(
     Some((rect, patch))
 }
 
-/// EPDC partial updates should use 8×8 boundaries (see libremarkable `partial_refresh` docs).
+/// EPDC partial updates should use 8×8 boundaries (must match `rm_common::expand_rect_to_epdc_grid`).
 fn expand_to_8px_grid(rect: mxcfb_rect, fb_w: u32, fb_h: u32) -> mxcfb_rect {
-    let left = (rect.left / 8) * 8;
-    let top = (rect.top / 8) * 8;
-    let right = ((rect.left + rect.width + 7) / 8) * 8;
-    let bottom = ((rect.top + rect.height + 7) / 8) * 8;
-    let right = right.min(fb_w);
-    let bottom = bottom.min(fb_h);
-    let width = right.saturating_sub(left);
-    let height = bottom.saturating_sub(top);
+    let (l, t, w, h) = expand_rect_to_epdc_grid(
+        rect.left,
+        rect.top,
+        rect.width,
+        rect.height,
+        fb_w,
+        fb_h,
+    );
     mxcfb_rect {
-        left,
-        top,
-        width,
-        height,
+        left: l,
+        top: t,
+        width: w,
+        height: h,
     }
 }
 
