@@ -665,7 +665,7 @@ async fn main() -> DynResult<()> {
             if screen_cli.stream_trace {
                 info!(
                     "rm-screen stream trace iter={frame_count} recv_wait_ms={ms_recv_wait:.1} drain_try_ms={ms_drain_spin:.1} \
-                     channel_dropped={skipped} (no encoded update; sleeping 16ms)",
+                     channel_dropped={skipped} (no encoded update; waiting for next frame)",
                 );
             } else if ms_recv_wait >= 2000.0 {
                 warn!(
@@ -673,7 +673,8 @@ async fn main() -> DynResult<()> {
                     ms_recv_wait / 1000.0,
                 );
             }
-            tokio::time::sleep(Duration::from_millis(16)).await;
+            // No extra sleep: `recv` already paces us at PipeWire rate; an unconditional delay here
+            // added ~16ms of input lag whenever a frame had no detectable damage.
             match recv_latest_drained(&mut frame_rx).await {
                 None => {
                     info!("frame pipeline ended after {frame_count} iterations (sender closed)");

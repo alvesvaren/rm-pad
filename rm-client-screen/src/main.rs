@@ -153,7 +153,6 @@ fn run_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut last_data = Instant::now();
     let mut updates_ok: u64 = 0;
-    let mut updates_skipped: u64 = 0;
 
     loop {
         ensure_min_bytes(stream, fd, &mut buf, HEADER_SIZE, &mut last_data, fb)?;
@@ -169,84 +168,82 @@ fn run_stream(
             continue;
         }
 
-        // Only the LAST complete update matters -- skip everything else.
-        // The PC merges dirty regions into a single update per frame, so
-        // processing just the latest one is always correct.
-        updates_skipped += (updates.len() - 1) as u64;
-        let (header, payload) = updates.into_iter().last().unwrap();
+        // One ACK per message: the host sends multiple partials per PipeWire frame (sparse
+        // damage). TCP may deliver several complete packets in one read — we must apply each in
+        // order; keeping only the last would drop tiles and stall the host.
+        for (header, payload) in updates {
+            let raw = match lz4_flex::block::decompress_size_prepended(&payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("LZ4 error: {e}");
+                    send_ack(stream);
+                    continue;
+                }
+            };
 
-        let raw = match lz4_flex::block::decompress_size_prepended(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("LZ4 error: {e}");
+            let w = header.width as u32;
+            let h = header.height as u32;
+            let expected = (w / 2) * h;
+            if raw.len() != expected as usize {
+                warn!("payload mismatch: {} vs {} for {}×{}", raw.len(), expected, w, h);
                 send_ack(stream);
                 continue;
             }
-        };
 
-        let w = header.width as u32;
-        let h = header.height as u32;
-        let expected = (w / 2) * h;
-        if raw.len() != expected as usize {
-            warn!("payload mismatch: {} vs {} for {}×{}", raw.len(), expected, w, h);
-            send_ack(stream);
-            continue;
-        }
-
-        let rgb565 = expand_gray4_packed(&raw, w, h);
-        let mapped = if header.waveform == UPDATE_COORDS_FRAMEBUFFER {
-            let rect = mxcfb_rect {
-                top: header.y as u32,
-                left: header.x as u32,
-                width: w,
-                height: h,
-            };
-            if rect.width < 2 || rect.height < 1 {
-                None
-            } else {
-                Some((rect, rgb565))
-            }
-        } else {
-            map_region_rgb565_to_fb(
-                &rgb565, w, h, header.x as u32, header.y as u32,
-                scale, off_x, off_y, fb_w, fb_h,
-            )
-        };
-        if let Some((rect, patch)) = mapped {
-            if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
-                error!("fb write {:?}: {e}", rect);
-            } else {
-                let al = expand_to_8px_grid(rect, fb_w, fb_h);
-                let mode = match refresh_mode {
-                    PartialRefreshMode::Async => PartialRefreshMode::Async,
-                    PartialRefreshMode::Wait => PartialRefreshMode::Wait,
-                    PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
+            let rgb565 = expand_gray4_packed(&raw, w, h);
+            let mapped = if header.waveform == UPDATE_COORDS_FRAMEBUFFER {
+                let rect = mxcfb_rect {
+                    top: header.y as u32,
+                    left: header.x as u32,
+                    width: w,
+                    height: h,
                 };
-                fb.partial_refresh(
-                    &al,
-                    mode,
-                    waveform,
-                    display_temp::TEMP_USE_REMARKABLE_DRAW,
-                    dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-                    0,
-                    false,
-                );
-
-                updates_ok += 1;
-                if updates_ok <= 3 {
-                    info!(
-                        "update #{updates_ok}: refresh {}×{}@({},{}) (skipped {} stale)",
-                        al.width, al.height, al.left, al.top, updates_skipped,
+                if rect.width < 2 || rect.height < 1 {
+                    None
+                } else {
+                    Some((rect, rgb565))
+                }
+            } else {
+                map_region_rgb565_to_fb(
+                    &rgb565, w, h, header.x as u32, header.y as u32,
+                    scale, off_x, off_y, fb_w, fb_h,
+                )
+            };
+            if let Some((rect, patch)) = mapped {
+                if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
+                    error!("fb write {:?}: {e}", rect);
+                } else {
+                    let al = expand_to_8px_grid(rect, fb_w, fb_h);
+                    let mode = match refresh_mode {
+                        PartialRefreshMode::Async => PartialRefreshMode::Async,
+                        PartialRefreshMode::Wait => PartialRefreshMode::Wait,
+                        PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
+                    };
+                    fb.partial_refresh(
+                        &al,
+                        mode,
+                        waveform,
+                        display_temp::TEMP_USE_REMARKABLE_DRAW,
+                        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
+                        0,
+                        false,
                     );
+
+                    updates_ok += 1;
+                    if updates_ok <= 3 {
+                        info!(
+                            "update #{updates_ok}: refresh {}×{}@({},{})",
+                            al.width, al.height, al.left, al.top,
+                        );
+                    }
                 }
             }
-        }
 
-        // ACK: tell the PC we're ready for the next frame.
-        send_ack(stream);
+            send_ack(stream);
+        }
     }
 
-    info!("stream ended: {updates_ok} applied, {updates_skipped} skipped");
+    info!("stream ended: {updates_ok} partial updates applied");
     Ok(())
 }
 
