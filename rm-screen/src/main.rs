@@ -24,7 +24,8 @@ use rm_common::expand_rect_to_epdc_grid;
 use rm_common::grab;
 use rm_common::protocol::{unix_time_millis, BatchAck, UpdateHeader, ACK_OK, ACK_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 use rm_common::screen_client::{
-    self, ensure_client_on_device, load_client_binary, spawn_remote_exec, spawn_reverse_tunnel,
+    ensure_client_on_device, load_client_binary, remote_screen_command, spawn_remote_exec,
+    spawn_reverse_tunnel, wrap_xochitl_exclusive_command,
 };
 use rm_common::ssh;
 use socket2::{Socket, TcpKeepalive};
@@ -278,7 +279,7 @@ struct ScreenCli {
     #[arg(long, env = "RMPAD_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Cross-compiled rm-client-screen binary (armv7 or aarch64)
+    /// Cross-compiled rm-client-screen binary for reMarkable 2 (armv7 or aarch64)
     #[arg(long, env = "RM_CLIENT_SCREEN_BIN")]
     client_binary: PathBuf,
 
@@ -303,7 +304,7 @@ struct ScreenCli {
     #[arg(long)]
     direct_tcp: bool,
 
-    /// PC hostname or IP placed in the AppLoad manifest / remote client command.
+    /// PC hostname or IP the tablet uses to reach this listener (direct TCP mode).
     #[arg(long)]
     advertise_host: Option<String>,
 
@@ -324,27 +325,6 @@ struct ScreenCli {
     /// **8** (default) splits disjoint damage without exploding into 16+ serial refreshes.
     #[arg(long, default_value_t = 8, env = "RM_SCREEN_SPARSE_PARTS_MAX")]
     sparse_parts_max: usize,
-
-    /// Modern qtfb-shim input handling toggle (`QTFB_SHIM_INPUT`).
-    #[arg(long, default_value_t = false, env = "RM_SCREEN_QTFB_SHIM_INPUT", value_parser = clap::builder::BoolishValueParser::new())]
-    qtfb_shim_input: bool,
-
-    /// Modern qtfb-shim model handling toggle (`QTFB_SHIM_MODEL`).
-    #[arg(long, default_value_t = false, env = "RM_SCREEN_QTFB_SHIM_MODEL", value_parser = clap::builder::BoolishValueParser::new())]
-    qtfb_shim_model: bool,
-
-    /// qtfb-shim framebuffer mode (`QTFB_SHIM_MODE`), e.g. `RGB565`.
-    #[arg(long, default_value = "RGB565", env = "RM_SCREEN_QTFB_SHIM_MODE")]
-    qtfb_shim_mode: String,
-
-    /// Export `KO_DONT_GRAB_INPUT=1` for qtfb-shim launches.
-    #[arg(long, default_value_t = true, env = "RM_SCREEN_QTFB_SHIM_DONT_GRAB_INPUT", value_parser = clap::builder::BoolishValueParser::new())]
-    qtfb_shim_dont_grab_input: bool,
-
-    /// Experimental: stop `xochitl` and run the mirror client directly for the session,
-    /// bypassing AppLoad/qtfb-shim presentation cadence entirely.
-    #[arg(long, default_value_t = false, env = "RM_SCREEN_EXCLUSIVE_DISPLAY", value_parser = clap::builder::BoolishValueParser::new())]
-    exclusive_display: bool,
 }
 
 #[tokio::main]
@@ -373,44 +353,9 @@ async fn main() -> DynResult<()> {
     let _arch = grab::detect_arch(&session)?;
     let client_bytes = load_client_binary(&screen_cli.client_binary)?;
     ensure_client_on_device(&session, &client_bytes)?;
-    let fb_shim = screen_client::detect_fb_shim(&session)?;
-    let qtfb_shim = screen_client::QtfbShimConfig {
-        input: screen_cli.qtfb_shim_input,
-        model: screen_cli.qtfb_shim_model,
-        mode: screen_cli.qtfb_shim_mode.clone(),
-        dont_grab_input: screen_cli.qtfb_shim_dont_grab_input,
-    };
-    let launch_shim = if screen_cli.exclusive_display {
-        None
-    } else {
-        fb_shim.as_ref()
-    };
-    let appload_launch = !screen_cli.exclusive_display
-        && matches!(launch_shim, Some(screen_client::FbShim::QtfbShim(_)));
-    if appload_launch {
-        info!("qtfb-shim detected — client will be launched from AppLoad on the tablet");
-    }
-    if screen_cli.exclusive_display {
-        warn!(
-            "--exclusive-display: stopping xochitl for the session and launching rm-client-screen directly; \
-             this bypasses AppLoad/qtfb-shim but is more invasive"
-        );
-    } else if launch_shim.is_some() {
-        info!(
-            "tablet launch env: {}",
-            screen_client::describe_shim_launch_env(launch_shim, &qtfb_shim)
-        );
-    }
-    match &fb_shim {
-        None if device.name == "reMarkable 2" => {
-            warn!(
-                "reMarkable 2 detected but no framebuffer shim found — \
-                 framebuffer updates will likely be invisible. \
-                 Install Vellum+AppLoad (qtfb-shim) or rm2fb on the device."
-            );
-        }
-        _ => {}
-    }
+    info!(
+        "tablet session: stop xochitl → rm-client-screen → restart xochitl on exit"
+    );
     let (fb_w, fb_h) = (
         screen_cli.tablet_fb_w.unwrap_or_else(|| device.framebuffer_size().0),
         screen_cli.tablet_fb_h.unwrap_or_else(|| device.framebuffer_size().1),
@@ -565,84 +510,25 @@ async fn main() -> DynResult<()> {
     let tunnel: Option<Child> = if screen_cli.direct_tcp {
         let pc_host = screen_cli.advertise_host.as_deref().expect("checked above");
         let pc_port = screen_cli.local_port;
-        if appload_launch {
-            let session = ssh::connect_for_detection(&config)?;
-            screen_client::ensure_appload_manifest(
-                &session,
-                launch_shim.expect("appload_launch implies shim"),
-                pc_host,
-                pc_port,
-                stream_info.size.0,
-                stream_info.size.1,
-                screen_cli.latency_log,
-                &qtfb_shim,
-            )?;
-            drop(session);
-            info!(
-                "AppLoad manifest: connect to {}:{} (direct TCP, capture {}×{}). \
-                 Launch \"Screen Mirror\" on the tablet.",
-                pc_host, pc_port, stream_info.size.0, stream_info.size.1
-            );
-            None
-        } else {
-            let remote_cmd = screen_client::remote_screen_command(
-                pc_host,
-                pc_port,
-                stream_info.size.0,
-                stream_info.size.1,
-                launch_shim,
-                screen_cli.latency_log,
-                &qtfb_shim,
-                !screen_cli.exclusive_display,
-            );
-            let remote_cmd = if screen_cli.exclusive_display {
-                screen_client::wrap_xochitl_exclusive_command(&remote_cmd)
-            } else {
-                remote_cmd
-            };
-            info!("remote client command: {}", remote_cmd);
-            Some(spawn_remote_exec(&config, &remote_cmd)?)
-        }
-    } else if appload_launch {
-        let session = ssh::connect_for_detection(&config)?;
-        screen_client::ensure_appload_manifest(
-            &session,
-            launch_shim.expect("appload_launch implies shim"),
-            "127.0.0.1",
-            screen_cli.remote_port,
+        let inner = remote_screen_command(
+            pc_host,
+            pc_port,
             stream_info.size.0,
             stream_info.size.1,
             screen_cli.latency_log,
-            &qtfb_shim,
-        )?;
-        drop(session);
-        info!(
-            "AppLoad manifest updated (port={}, capture={}×{}). \
-             Launch \"Screen Mirror\" from AppLoad on the tablet.",
-            screen_cli.remote_port, stream_info.size.0, stream_info.size.1
         );
-        Some(screen_client::spawn_tunnel_only(
-            &config,
-            screen_cli.remote_port,
-            "127.0.0.1",
-            screen_cli.local_port,
-        )?)
+        let remote_cmd = wrap_xochitl_exclusive_command(&inner);
+        info!("remote client command: {}", remote_cmd);
+        Some(spawn_remote_exec(&config, &remote_cmd)?)
     } else {
-        let remote_cmd = screen_client::remote_screen_command(
+        let inner = remote_screen_command(
             "127.0.0.1",
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
-            launch_shim,
             screen_cli.latency_log,
-            &qtfb_shim,
-            !screen_cli.exclusive_display,
         );
-        let remote_cmd = if screen_cli.exclusive_display {
-            screen_client::wrap_xochitl_exclusive_command(&remote_cmd)
-        } else {
-            remote_cmd
-        };
+        let remote_cmd = wrap_xochitl_exclusive_command(&inner);
         info!(
             "remote client command: {} (capture {}×{})",
             remote_cmd, stream_info.size.0, stream_info.size.1
@@ -662,14 +548,8 @@ async fn main() -> DynResult<()> {
         let _ = tx.send(lis.accept().map(|(s, _)| s));
     });
 
-    let timeout = if appload_launch {
-        Duration::from_secs(120)
-    } else {
-        Duration::from_secs(30)
-    };
-    if appload_launch {
-        info!("Waiting for you to launch \"Screen Mirror\" from AppLoad on the tablet (timeout {}s)…", timeout.as_secs());
-    } else if screen_cli.direct_tcp {
+    let timeout = Duration::from_secs(30);
+    if screen_cli.direct_tcp {
         info!(
             "Waiting for tablet TCP to {}:{} (timeout {}s)…",
             screen_cli.bind_addr,
@@ -685,9 +565,6 @@ async fn main() -> DynResult<()> {
         Err(_) => {
             if let Some(mut t) = tunnel {
                 let _ = t.kill();
-            }
-            if appload_launch {
-                return Err("timed out — launch \"Screen Mirror\" from AppLoad on the tablet while rm-screen is running".into());
             }
             return Err("timed out waiting for tablet TCP connection (check network / SSH tunnel)".into());
         }

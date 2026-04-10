@@ -1,0 +1,27 @@
+---
+description: How to work in this repo—SSH, no compatibility theater, delete freely, split modules
+alwaysApply: true
+---
+
+# Agent workflow (rm-mouse)
+
+## Device access
+
+You may use SSH to the reMarkable whenever it helps (deploy, debug, verify). Defaults:
+
+- **Host:** `10.11.99.1`
+- **Key:** `~/.ssh/rm-key`
+
+Example: `ssh -i ~/.ssh/rm-key root@10.11.99.1`
+
+## Compatibility and options
+
+The maintainer owns the **entire** stack. Do not design for hypothetical external users, legacy environments, or “maybe someday” compatibility. Prefer one clear path. **Remove** switches, feature flags, and code paths that are not needed for the intended future use of the project.
+
+## Deleting and refactoring
+
+There is **version control**. Prefer small, reviewable changes, but do not avoid removals or rewrites out of fear—git preserves history. Delete dead code, unused crates/modules, and obsolete options instead of carrying them.
+
+## File and module layout
+
+Avoid dumping everything into a single huge source file. **Split** by responsibility: new logic belongs in focused modules or sub-crates; grow `main.rs` / entrypoints thinly. When a file grows hard to navigate, extract coherent pieces rather than appending more to the same file.

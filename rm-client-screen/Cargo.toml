@@ -10,3 +10,4 @@ libremarkable = { version = "0.7.0", default-features = false, features = ["fram
 log = "0.4"
 lz4_flex = "0.11"
 libc = "0.2"
+memmap2 = "0.9"

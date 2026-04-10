@@ -1368,6 +1368,7 @@ dependencies = [
  "libremarkable",
  "log",
  "lz4_flex",
+ "memmap2",
  "rm-common",
 ]
 
