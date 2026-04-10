@@ -4,7 +4,7 @@
 //! SRC_W/SRC_H are the host capture size (e.g. 1920×1200); regions are letterboxed to fit
 //! the device framebuffer. `rm-screen` passes these automatically.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::time::Instant;
@@ -15,7 +15,7 @@ use libremarkable::framebuffer::common::{
 };
 use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefreshMode};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use rm_common::protocol::{UpdateHeader, HEADER_SIZE};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -30,8 +30,19 @@ fn main() -> DynResult<()> {
     let mut stream = TcpStream::connect(&addr)?;
     info!("rm-client-screen connected to {}", addr);
 
+    stream.set_nodelay(true)?;
     stream.set_nonblocking(true)?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    // Small receive buffer to limit how much data can queue on our side.
+    unsafe {
+        let buf_size: libc::c_int = 32 * 1024;
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 
     let mut fb = Framebuffer::new();
     let fb_w = fb.var_screen_info.xres;
@@ -125,6 +136,7 @@ fn run_stream(
     let mut buf: Vec<u8> = Vec::new();
     let mut last_data = Instant::now();
     let mut updates_ok: u64 = 0;
+    let mut updates_skipped: u64 = 0;
 
     loop {
         ensure_min_bytes(stream, fd, &mut buf, HEADER_SIZE, &mut last_data, fb)?;
@@ -132,78 +144,158 @@ fn run_stream(
             break;
         }
 
-        let hdr_slice: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().unwrap();
-        let Some(header) = UpdateHeader::from_bytes(&hdr_slice) else {
-            return Err("invalid header".into());
-        };
+        // Greedily read all available data so we can skip stale updates.
+        drain_available(stream, &mut buf);
 
-        let total = HEADER_SIZE + header.payload_size as usize;
-        ensure_min_bytes(stream, fd, &mut buf, total, &mut last_data, fb)?;
+        let updates = parse_complete_updates(&mut buf);
+        if updates.is_empty() {
+            continue;
+        }
 
-        let payload = buf[HEADER_SIZE..total].to_vec();
-        buf.drain(..total);
+        // Only the LAST complete update matters -- skip everything else.
+        // The PC merges dirty regions into a single update per frame, so
+        // processing just the latest one is always correct.
+        updates_skipped += (updates.len() - 1) as u64;
+        let (header, payload) = updates.into_iter().last().unwrap();
 
         let raw = match lz4_flex::block::decompress_size_prepended(&payload) {
             Ok(v) => v,
             Err(e) => {
                 warn!("LZ4 error: {e}");
+                send_ack(stream);
                 continue;
             }
         };
 
         let w = header.width as u32;
         let h = header.height as u32;
-        let expected_packed = (w / 2) * h;
-        if raw.len() != expected_packed as usize {
-            warn!(
-                "payload size mismatch: got {} expected {} for {}x{}",
-                raw.len(),
-                expected_packed,
-                w,
-                h
-            );
+        let expected = (w / 2) * h;
+        if raw.len() != expected as usize {
+            warn!("payload mismatch: {} vs {} for {}×{}", raw.len(), expected, w, h);
+            send_ack(stream);
             continue;
         }
 
         let rgb565 = expand_gray4_packed(&raw, w, h);
-        let sx = header.x as u32;
-        let sy = header.y as u32;
+        if let Some((rect, patch)) = map_region_rgb565_to_fb(
+            &rgb565, w, h, header.x as u32, header.y as u32,
+            scale, off_x, off_y, fb_w, fb_h,
+        ) {
+            if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
+                error!("fb write {:?}: {e}", rect);
+            } else {
+                let al = expand_to_8px_grid(rect, fb_w, fb_h);
+                let mode = match refresh_mode {
+                    PartialRefreshMode::Async => PartialRefreshMode::Async,
+                    PartialRefreshMode::Wait => PartialRefreshMode::Wait,
+                    PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
+                };
+                fb.partial_refresh(
+                    &al,
+                    mode,
+                    waveform_mode::WAVEFORM_MODE_GC16_FAST,
+                    display_temp::TEMP_USE_REMARKABLE_DRAW,
+                    dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
+                    0,
+                    false,
+                );
 
-        let Some((rect, patch)) = map_region_rgb565_to_fb(
-            &rgb565, w, h, sx, sy, scale, off_x, off_y, fb_w, fb_h,
-        ) else {
-            debug!(
-                "skip region source {}×{}@({},{}): maps outside visible framebuffer",
-                w, h, sx, sy
-            );
-            continue;
-        };
-
-        if let Err(e) = restore_merge_refresh_8(fb, rect, &patch, &refresh_mode) {
-            error!("EPD update {:?}: {e}", rect);
-            continue;
+                updates_ok += 1;
+                if updates_ok <= 3 {
+                    info!(
+                        "update #{updates_ok}: refresh {}×{}@({},{}) (skipped {} stale)",
+                        al.width, al.height, al.left, al.top, updates_skipped,
+                    );
+                }
+            }
         }
 
-        updates_ok += 1;
-        if updates_ok <= 3 {
-            let al = expand_to_8px_grid(rect, fb_w, fb_h);
-            info!(
-                "first updates: #{} patch ({},{}) {}×{} ← host {}×{}@({sx},{sy}); 8px-aligned refresh {}×{}@({},{})",
-                updates_ok,
-                rect.left,
-                rect.top,
-                rect.width,
-                rect.height,
-                w,
-                h,
-                al.width,
-                al.height,
-                al.left,
-                al.top,
-            );
-        }
+        // ACK: tell the PC we're ready for the next frame.
+        send_ack(stream);
     }
 
+    info!("stream ended: {updates_ok} applied, {updates_skipped} skipped");
+    Ok(())
+}
+
+fn send_ack(stream: &mut TcpStream) {
+    let _ = stream.write_all(&[0x06]);
+    let _ = stream.flush();
+}
+
+/// Parse all complete (header + full payload) updates from the front of `buf`,
+/// draining consumed bytes. Leaves any trailing incomplete data in `buf`.
+fn parse_complete_updates(buf: &mut Vec<u8>) -> Vec<(UpdateHeader, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut pos = 0;
+    loop {
+        if pos + HEADER_SIZE > buf.len() {
+            break;
+        }
+        let hdr_slice: [u8; HEADER_SIZE] = buf[pos..pos + HEADER_SIZE].try_into().unwrap();
+        let Some(header) = UpdateHeader::from_bytes(&hdr_slice) else {
+            break;
+        };
+        let total = HEADER_SIZE + header.payload_size as usize;
+        if pos + total > buf.len() {
+            break;
+        }
+        let payload = buf[pos + HEADER_SIZE..pos + total].to_vec();
+        results.push((header, payload));
+        pos += total;
+    }
+    if pos > 0 {
+        buf.drain(..pos);
+    }
+    results
+}
+
+/// Non-blocking drain: read everything currently available from the socket.
+fn drain_available(stream: &mut TcpStream, buf: &mut Vec<u8>) {
+    let mut tmp = [0u8; 32 * 1024];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Write a region patch to the framebuffer without triggering a refresh.
+fn write_patch_to_fb(
+    fb: &mut Framebuffer,
+    rect: mxcfb_rect,
+    patch: &[u8],
+    fb_w: u32,
+    fb_h: u32,
+) -> Result<(), &'static str> {
+    let bpp = 2usize;
+    let expect = (rect.width as usize)
+        .checked_mul(rect.height as usize)
+        .and_then(|p| p.checked_mul(bpp))
+        .ok_or("rect size overflow")?;
+    if patch.len() != expect {
+        return Err("patch length does not match rect");
+    }
+
+    let al = expand_to_8px_grid(rect, fb_w, fb_h);
+    if al.width < 1 || al.height < 1 {
+        return Ok(());
+    }
+
+    let mut canvas = fb.dump_region(al)?;
+    let row_patch = rect.width as usize * bpp;
+    let row_canvas = al.width as usize * bpp;
+    let ox = (rect.left.saturating_sub(al.left)) as usize * bpp;
+    let oy = rect.top.saturating_sub(al.top) as usize;
+    for row in 0..rect.height as usize {
+        let dst = (oy + row) * row_canvas + ox;
+        let src = row * row_patch;
+        canvas[dst..dst + row_patch].copy_from_slice(&patch[src..src + row_patch]);
+    }
+
+    fb.restore_region(al, &canvas)?;
     Ok(())
 }
 
@@ -285,60 +377,6 @@ fn expand_to_8px_grid(rect: mxcfb_rect, fb_w: u32, fb_h: u32) -> mxcfb_rect {
     }
 }
 
-/// Copy `patch` (size `rect`×RGB565) into a dumped 8×8-aligned region, then refresh.
-fn restore_merge_refresh_8(
-    fb: &mut Framebuffer,
-    rect: mxcfb_rect,
-    patch: &[u8],
-    refresh_mode: &PartialRefreshMode,
-) -> Result<(), &'static str> {
-    let bpp = 2usize;
-    let expect = (rect.width as usize)
-        .checked_mul(rect.height as usize)
-        .and_then(|p| p.checked_mul(bpp))
-        .ok_or("rect size overflow")?;
-    if patch.len() != expect {
-        return Err("patch length does not match rect");
-    }
-
-    let fb_w = fb.var_screen_info.xres;
-    let fb_h = fb.var_screen_info.yres;
-    let al = expand_to_8px_grid(rect, fb_w, fb_h);
-    if al.width < 1 || al.height < 1 {
-        return Ok(());
-    }
-
-    let mut canvas = fb.dump_region(al)?;
-    let row_patch = rect.width as usize * bpp;
-    let row_canvas = al.width as usize * bpp;
-    let ox = (rect.left.saturating_sub(al.left)) as usize * bpp;
-    let oy = rect.top.saturating_sub(al.top) as usize;
-    for row in 0..rect.height as usize {
-        let dst = (oy + row) * row_canvas + ox;
-        let src = row * row_patch;
-        canvas[dst..dst + row_patch].copy_from_slice(&patch[src..src + row_patch]);
-    }
-
-    fb.restore_region(al, &canvas)?;
-
-    // Grayscale mirroring: prefer GC16_FAST. DU is for 1-bit style content and can no-op or
-    // behave badly when pixels are not saturated black/white on stock imx epdc.
-    let mode = match refresh_mode {
-        PartialRefreshMode::Async => PartialRefreshMode::Async,
-        PartialRefreshMode::Wait => PartialRefreshMode::Wait,
-        PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
-    };
-    fb.partial_refresh(
-        &al,
-        mode,
-        waveform_mode::WAVEFORM_MODE_GC16_FAST,
-        display_temp::TEMP_USE_REMARKABLE_DRAW,
-        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-        0,
-        false,
-    );
-    Ok(())
-}
 
 fn ensure_min_bytes(
     stream: &mut TcpStream,

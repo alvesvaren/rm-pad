@@ -239,7 +239,8 @@ const APPLOAD_APP_DIR: &str = "/home/root/xovi/exthome/appload/rm-screen";
 pub fn ensure_appload_manifest(
     session: &Session,
     shim: &FbShim,
-    remote_port: u16,
+    host: &str,
+    port: u16,
     src_w: u32,
     src_h: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -258,14 +259,14 @@ pub fn ensure_appload_manifest(
         r#"{{
   "name": "Screen Mirror",
   "application": "{}",
-  "args": ["127.0.0.1", "{}", "{}", "{}"],
+  "args": ["{}", "{}", "{}", "{}"],
   "environment": {{
     "LD_PRELOAD": "{}",
     "RUST_LOG": "info"{}
   }},
   "qtfb": true
 }}"#,
-        REMOTE_CLIENT_PATH, remote_port, src_w, src_h, preload, extra_env,
+        REMOTE_CLIENT_PATH, host, port, src_w, src_h, preload, extra_env,
     );
 
     let cmd = format!(

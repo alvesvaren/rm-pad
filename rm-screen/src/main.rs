@@ -1,6 +1,6 @@
 //! PC-side screen mirror: PipeWire (via portal) → dirty regions → LZ4 → TCP to tablet.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use log::{debug, error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
 use rm_common::grab;
-use rm_common::protocol::{UpdateHeader, HEADER_SIZE};
+use rm_common::protocol::UpdateHeader;
 use rm_common::screen_client::{self, ensure_client_on_device, load_client_binary, spawn_reverse_tunnel};
 use rm_common::ssh;
 use socket2::{Socket, TcpKeepalive};
@@ -67,11 +67,6 @@ async fn main() -> DynResult<()> {
     let device = DeviceProfile::current();
     let config = load_merged_config(&screen_cli, device);
 
-    info!(
-        "rm-screen: listening for tablet on 127.0.0.1:{} (SSH reverse → {}:{} on device)",
-        screen_cli.local_port, config.host, screen_cli.remote_port
-    );
-
     info!("Connecting to {} for device detection…", config.host);
     let session = ssh::connect_for_detection(&config)?;
     let device = DeviceProfile::detect_via_ssh(&session)?;
@@ -99,7 +94,7 @@ async fn main() -> DynResult<()> {
 
     let listener = TcpListener::bind(("127.0.0.1", screen_cli.local_port))?;
     info!(
-        "local TCP listener ready on {} (waiting for tunnel + rm-client-screen before capture starts)",
+        "TCP listener ready on {} (waiting for client connection)",
         listener.local_addr()?
     );
 
@@ -185,7 +180,7 @@ async fn main() -> DynResult<()> {
         .map_err(|e| e.to_string())?;
     info!("PipeWire stream connected (waiting for tablet TCP before consuming frames)");
 
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<VideoFrame>(8);
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<VideoFrame>(2);
     let bridge = std::thread::spawn(move || {
         let mut pw_thread = pw_thread;
         let mut bridged: u64 = 0;
@@ -214,12 +209,11 @@ async fn main() -> DynResult<()> {
     });
 
     let mut tunnel: Child = if appload_launch {
-        // qtfb-shim: the app must be launched from AppLoad for display compositing.
-        // Write the manifest (with connection args) and start a tunnel-only SSH session.
         let session = ssh::connect_for_detection(&config)?;
         screen_client::ensure_appload_manifest(
             &session,
             fb_shim.as_ref().expect("appload_launch implies shim"),
+            "127.0.0.1",
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
@@ -284,8 +278,8 @@ async fn main() -> DynResult<()> {
         }
     };
     match (sock.peer_addr(), sock.local_addr()) {
-        (Ok(peer), Ok(local)) => info!("tablet TCP tunnel up (peer {peer}, local {local}); starting screen encode"),
-        _ => info!("tablet TCP tunnel up; starting screen encode"),
+        (Ok(peer), Ok(local)) => info!("tablet connected (peer {peer}, local {local}); starting screen encode"),
+        _ => info!("tablet connected; starting screen encode"),
     }
     configure_tcp_stream(&sock)?;
 
@@ -293,37 +287,68 @@ async fn main() -> DynResult<()> {
     let mut damage = DamageDetector::new(DamageConfig::low_bandwidth());
 
     let mut frame_count: u64 = 0;
+    let mut frames_dropped: u64 = 0;
     let mut last_progress = Instant::now();
     loop {
-        match frame_rx.recv().await {
-            Some(frame) => {
-                frame_count += 1;
-                if frame_count <= 5 {
-                    info!(
-                        "frame #{} {}×{} format={:?} compositor_damage_rects={}",
-                        frame_count,
-                        frame.width,
-                        frame.height,
-                        frame.format,
-                        frame.damage_regions.len(),
-                    );
-                } else if last_progress.elapsed() >= Duration::from_secs(5) {
-                    info!(
-                        "streaming… {} frames processed (latest {}×{})",
-                        frame_count, frame.width, frame.height
-                    );
-                    last_progress = Instant::now();
-                }
-                if let Err(e) = process_frame(&mut sock, &mut damage, &frame) {
-                    error!("stream error: {e}");
-                    info!("stopped after {frame_count} frames (write to tablet failed)");
-                    break;
-                }
-            }
+        let frame = match frame_rx.recv().await {
+            Some(f) => f,
             None => {
-                info!("frame pipeline ended after {frame_count} frames (sender closed — capture or bridge stopped)");
+                info!("frame pipeline ended after {frame_count} frames sent, {frames_dropped} dropped (sender closed)");
                 break;
             }
+        };
+
+        // Drain the channel: keep only the freshest frame.
+        let mut latest = frame;
+        let mut skipped: u64 = 0;
+        while let Ok(newer) = frame_rx.try_recv() {
+            latest = newer;
+            skipped += 1;
+        }
+        frames_dropped += skipped;
+
+        frame_count += 1;
+        if frame_count <= 3 {
+            info!(
+                "frame #{} {}×{} format={:?} compositor_damage_rects={} (skipped {skipped})",
+                frame_count,
+                latest.width,
+                latest.height,
+                latest.format,
+                latest.damage_regions.len(),
+            );
+        } else if last_progress.elapsed() >= Duration::from_secs(5) {
+            info!(
+                "streaming: {frame_count} sent, {frames_dropped} dropped (latest {}×{})",
+                latest.width, latest.height
+            );
+            last_progress = Instant::now();
+        }
+
+        let sent = match process_frame(&mut sock, &mut damage, &latest) {
+            Ok(sent) => sent,
+            Err(e) => {
+                error!("stream error: {e}");
+                info!("stopped after {frame_count} frames sent (write to tablet failed)");
+                break;
+            }
+        };
+
+        if sent {
+            // Wait for tablet ACK before sending the next frame.  This keeps
+            // exactly one update in the pipeline (no SSH/TCP buffer bloat).
+            // While blocked here, PipeWire frames accumulate in the channel;
+            // drain-to-latest on the next iteration picks the freshest.
+            let mut ack = [0u8; 1];
+            if let Err(e) = sock.read_exact(&mut ack) {
+                error!("ACK read failed: {e}");
+                info!("stopped after {frame_count} frames sent (tablet gone?)");
+                break;
+            }
+        } else {
+            // Nothing dirty — brief sleep so we don't busy-spin, then
+            // drain-to-latest will grab a newer frame.
+            tokio::time::sleep(Duration::from_millis(16)).await;
         }
     }
     drop(frame_rx);
@@ -362,66 +387,83 @@ fn load_merged_config(cli: &ScreenCli, device: &'static DeviceProfile) -> Config
 
 fn configure_tcp_stream(sock: &std::net::TcpStream) -> DynResult<()> {
     sock.set_nodelay(true)?;
-    sock.set_write_timeout(Some(Duration::from_secs(30)))?;
+    sock.set_write_timeout(Some(Duration::from_secs(5)))?;
     let raw = sock.as_raw_fd();
     let s = unsafe { Socket::from_raw_fd(raw) };
+    s.set_send_buffer_size(32 * 1024)?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
     s.set_tcp_keepalive(&ka)?;
     std::mem::forget(s);
     Ok(())
 }
 
+/// Merge all dirty regions into a single bounding-box update.
+/// Returns `true` if an update was sent (caller must wait for ACK).
 fn process_frame(
     sock: &mut std::net::TcpStream,
     damage: &mut DamageDetector,
     frame: &VideoFrame,
-) -> DynResult<()> {
+) -> DynResult<bool> {
     let Some(data_arc) = frame.data() else {
         warn!("DMA-BUF frame skipped (no CPU pixels); disable GPU-only capture in compositor if this repeats");
         damage.invalidate();
-        return Ok(());
+        return Ok(false);
     };
     let data = data_arc.as_slice();
     let w = frame.width;
     let h = frame.height;
 
     let regions = regions_for_frame(frame, damage, data, w, h);
-    let mut regions_sent: u32 = 0;
-    let mut wire_bytes: u64 = 0;
 
-    for r in regions {
-        let (x, y, rw, rh) = clip_region(r, w, h);
+    // Merge all dirty rects into one bounding box.
+    let mut x0 = w;
+    let mut y0 = h;
+    let mut x1 = 0u32;
+    let mut y1 = 0u32;
+    for r in &regions {
+        let (rx, ry, rw, rh) = clip_region(*r, w, h);
         if rw < 2 || rh < 1 {
             continue;
         }
-        let rw = rw & !1;
-        let packed = pack_region_gray4(data, frame.stride, frame.format, x, y, rw, rh)?;
-        let compressed = lz4_flex::block::compress_prepend_size(&packed);
-        let header = UpdateHeader {
-            x,
-            y,
-            width: rw,
-            height: rh,
-            waveform: WAVEFORM_DU,
-            payload_size: compressed.len() as u32,
-        };
-        sock.write_all(&header.to_bytes())?;
-        sock.write_all(&compressed)?;
-        sock.flush()?;
-        regions_sent += 1;
-        wire_bytes += HEADER_SIZE as u64 + compressed.len() as u64;
+        x0 = x0.min(rx as u32);
+        y0 = y0.min(ry as u32);
+        x1 = x1.max(rx as u32 + rw as u32);
+        y1 = y1.max(ry as u32 + rh as u32);
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return Ok(false);
+    }
+    let mx = x0 as u16;
+    let my = y0 as u16;
+    let mw = ((x1 - x0) as u16) & !1;
+    let mh = (y1 - y0) as u16;
+    if mw < 2 || mh < 1 {
+        return Ok(false);
     }
 
-    if regions_sent > 0 {
-        debug!(
-            "encoded frame {}×{} → {regions_sent} region update(s), {wire_bytes} B on wire (LZ4 payloads + headers)",
-            w, h
-        );
-    } else {
-        debug!("frame {}×{}: no regions sent (fully skipped or empty damage)", w, h);
-    }
+    let packed = pack_region_gray4(data, frame.stride, frame.format, mx, my, mw, mh)?;
+    let compressed = lz4_flex::block::compress_prepend_size(&packed);
+    let header = UpdateHeader {
+        x: mx,
+        y: my,
+        width: mw,
+        height: mh,
+        waveform: WAVEFORM_DU,
+        payload_size: compressed.len() as u32,
+    };
 
-    Ok(())
+    let mut wire_buf = Vec::with_capacity(header.to_bytes().len() + compressed.len());
+    wire_buf.extend_from_slice(&header.to_bytes());
+    wire_buf.extend_from_slice(&compressed);
+    sock.write_all(&wire_buf)?;
+    sock.flush()?;
+
+    debug!(
+        "encoded frame {}×{} → merged {}×{} @ ({mx},{my}), {} B on wire",
+        w, h, mw, mh, wire_buf.len()
+    );
+
+    Ok(true)
 }
 
 fn regions_for_frame(
