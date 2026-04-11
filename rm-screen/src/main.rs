@@ -20,6 +20,7 @@ use lamco_portal::{PortalConfig, PortalManager};
 use log::{debug, error, info, warn};
 use rm_common::config::Config;
 use rm_common::device::DeviceProfile;
+use rm_common::orientation::{mirror_view_pixel_to_wire, mirror_wire_pixel_to_view, Orientation};
 use rm_common::expand_rect_to_epdc_grid;
 use rm_common::grab;
 use rm_common::protocol::{UpdateHeader, UPDATE_COORDS_FRAMEBUFFER};
@@ -126,6 +127,10 @@ struct ScreenCli {
     /// Default is host-side pixel diff for tight BGRx buffers — matches real on-screen changes.
     #[arg(long, env = "RM_SCREEN_PREFER_PORTAL_DAMAGE")]
     prefer_portal_damage: bool,
+
+    /// Screen orientation (overrides `rm-pad.toml`). Must match rm-pad so the mirror is upright.
+    #[arg(long, value_parser = clap::value_parser!(Orientation))]
+    orientation: Option<Orientation>,
 }
 
 #[tokio::main]
@@ -135,6 +140,10 @@ async fn main() -> DynResult<()> {
     let screen_cli = ScreenCli::parse();
     let device = DeviceProfile::current();
     let config = load_merged_config(&screen_cli, device);
+    info!(
+        "screen mirror orientation: {} (same setting as rm-pad; from config or --orientation)",
+        config.orientation
+    );
 
     info!("Connecting to {} for device detection…", config.host);
     let session = ssh::connect_for_detection(&config)?;
@@ -320,6 +329,7 @@ async fn main() -> DynResult<()> {
                 pc_port,
                 stream_info.size.0,
                 stream_info.size.1,
+                config.orientation,
             )?;
             drop(session);
             info!(
@@ -334,6 +344,7 @@ async fn main() -> DynResult<()> {
                 pc_port,
                 stream_info.size.0,
                 stream_info.size.1,
+                config.orientation,
                 fb_shim.as_ref(),
             );
             info!("remote client command: {}", remote_cmd);
@@ -348,6 +359,7 @@ async fn main() -> DynResult<()> {
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
+            config.orientation,
         )?;
         drop(session);
         info!(
@@ -367,6 +379,7 @@ async fn main() -> DynResult<()> {
             screen_cli.remote_port,
             stream_info.size.0,
             stream_info.size.1,
+            config.orientation,
             fb_shim.as_ref(),
         );
         info!(
@@ -432,9 +445,14 @@ async fn main() -> DynResult<()> {
     let mut damage = DamageDetector::new(damage_config_for_screen_mirror());
     // Portal `stream_info.size` can disagree with actual PipeWire `VideoFrame` dimensions; scaling
     // and `gray_at_fb_pixel` must use the frame buffer size we read from.
-    let mut lb = Letterbox::new(stream_info.size.0, stream_info.size.1, fb_w, fb_h);
+    let mut lb = Letterbox::new(stream_info.size.0, stream_info.size.1, fb_w, fb_h, config.orientation);
     info!(
-        "letterbox (portal): scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+        "letterbox (portal): orientation={} fit {}×{} (wire {}×{}) scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+        lb.orientation,
+        lb.fit_w,
+        lb.fit_h,
+        lb.wire_w,
+        lb.wire_h,
         lb.scale,
         lb.off_x,
         lb.off_y,
@@ -510,10 +528,13 @@ async fn main() -> DynResult<()> {
                 stream_info.size.0,
                 stream_info.size.1
             );
-            lb = Letterbox::new(latest.width, latest.height, fb_w, fb_h);
+            lb = Letterbox::new(latest.width, latest.height, fb_w, fb_h, config.orientation);
             damage.invalidate();
             info!(
-                "letterbox (actual frames): scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+                "letterbox (actual frames): orientation={} fit {}×{} scale {:.4} offset ({}, {}) fitted {}×{} for source {}×{}",
+                lb.orientation,
+                lb.fit_w,
+                lb.fit_h,
                 lb.scale,
                 lb.off_x,
                 lb.off_y,
@@ -719,7 +740,7 @@ fn load_merged_config(cli: &ScreenCli, device: &'static DeviceProfile) -> Config
         no_grab_input: false,
         no_palm_rejection: false,
         palm_grace_ms: None,
-        orientation: None,
+        orientation: cli.orientation,
         config: cli.config.clone(),
     };
     Config::load(&fake_cli, device)
@@ -743,12 +764,16 @@ fn configure_tcp_stream(sock: &std::net::TcpStream) -> DynResult<()> {
     Ok(())
 }
 
-/// Host-side letterboxing: same geometry as `rm-client-screen` uses for capture → FB fit.
+/// Host-side letterboxing: view-space fit (`fit_w`×`fit_h`) then mapped to wire/mmap coords via orientation.
 struct Letterbox {
     src_w: u32,
     src_h: u32,
-    fb_w: u32,
-    fb_h: u32,
+    /// Mmap / protocol dimensions (e.g. 1404×1872).
+    wire_w: u32,
+    wire_h: u32,
+    fit_w: u32,
+    fit_h: u32,
+    orientation: Orientation,
     scale: f64,
     off_x: u32,
     off_y: u32,
@@ -757,17 +782,21 @@ struct Letterbox {
 }
 
 impl Letterbox {
-    fn new(src_w: u32, src_h: u32, fb_w: u32, fb_h: u32) -> Self {
-        let scale = (fb_w as f64 / src_w as f64).min(fb_h as f64 / src_h as f64);
+    fn new(src_w: u32, src_h: u32, wire_w: u32, wire_h: u32, orientation: Orientation) -> Self {
+        let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(wire_w, wire_h);
+        let scale = (fit_w as f64 / src_w as f64).min(fit_h as f64 / src_h as f64);
         let dst_fit_w = ((src_w as f64 * scale).floor() as u32) & !1;
         let dst_fit_h = (src_h as f64 * scale).floor() as u32;
-        let off_x = fb_w.saturating_sub(dst_fit_w) / 2;
-        let off_y = fb_h.saturating_sub(dst_fit_h) / 2;
+        let off_x = fit_w.saturating_sub(dst_fit_w) / 2;
+        let off_y = fit_h.saturating_sub(dst_fit_h) / 2;
         Self {
             src_w,
             src_h,
-            fb_w,
-            fb_h,
+            wire_w,
+            wire_h,
+            fit_w,
+            fit_h,
+            orientation,
             scale,
             off_x,
             off_y,
@@ -776,23 +805,45 @@ impl Letterbox {
         }
     }
 
-    /// Map a capture-space bounding box to framebuffer pixels (even width), matching tablet rounding.
+    /// Map a capture-space bounding box to wire-framebuffer pixels (even width), matching tablet rounding.
     fn capture_bbox_to_fb(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Option<(u32, u32, u16, u16)> {
         let dx0 = self.off_x as f64 + x0 as f64 * self.scale;
         let dy0 = self.off_y as f64 + y0 as f64 * self.scale;
         let dx1 = self.off_x as f64 + x1 as f64 * self.scale;
         let dy1 = self.off_y as f64 + y1 as f64 * self.scale;
-        let ix0 = dx0.floor().max(0.0) as u32;
-        let iy0 = dy0.floor().max(0.0) as u32;
-        let ix1 = dx1.ceil().min(self.fb_w as f64) as u32;
-        let iy1 = dy1.ceil().min(self.fb_h as f64) as u32;
-        let mut out_w = ix1.saturating_sub(ix0);
+        let ixv0 = dx0.floor().max(0.0) as u32;
+        let iyv0 = dy0.floor().max(0.0) as u32;
+        let ixv1 = dx1.ceil().min(self.fit_w as f64) as u32;
+        let iyv1 = dy1.ceil().min(self.fit_h as f64) as u32;
+        if ixv0 >= ixv1 || iyv0 >= iyv1 {
+            return None;
+        }
+        let x1m = ixv1.saturating_sub(1);
+        let y1m = iyv1.saturating_sub(1);
+        let corners = [
+            (ixv0, iyv0),
+            (x1m, iyv0),
+            (ixv0, y1m),
+            (x1m, y1m),
+        ];
+        let mut min_wx = u32::MAX;
+        let mut min_wy = u32::MAX;
+        let mut max_wx = 0u32;
+        let mut max_wy = 0u32;
+        for (vx, vy) in corners {
+            let (wx, wy) = mirror_view_pixel_to_wire(vx, vy, self.orientation, self.wire_w, self.wire_h);
+            min_wx = min_wx.min(wx);
+            min_wy = min_wy.min(wy);
+            max_wx = max_wx.max(wx);
+            max_wy = max_wy.max(wy);
+        }
+        let mut out_w = max_wx.saturating_sub(min_wx).saturating_add(1);
         out_w &= !1;
-        let out_h = iy1.saturating_sub(iy0);
+        let out_h = max_wy.saturating_sub(min_wy).saturating_add(1);
         if out_w < 2 || out_h < 1 {
             return None;
         }
-        Some((ix0, iy0, out_w as u16, out_h as u16))
+        Some((min_wx, min_wy, out_w as u16, out_h as u16))
     }
 }
 
@@ -904,8 +955,8 @@ fn encode_capture_bbox(
         fb_iy,
         fb_mw as u32,
         fb_mh as u32,
-        lb.fb_w,
-        lb.fb_h,
+        lb.wire_w,
+        lb.wire_h,
     );
     if ew < 2 || eh < 1 {
         return Ok(None);
@@ -1114,8 +1165,9 @@ fn gray_at_fb_pixel(
     screen_x: u32,
     screen_y: u32,
 ) -> u8 {
-    let u = (screen_x as f64 + 0.5 - lb.off_x as f64) / lb.scale;
-    let v = (screen_y as f64 + 0.5 - lb.off_y as f64) / lb.scale;
+    let (vx, vy) = mirror_wire_pixel_to_view(screen_x, screen_y, lb.orientation, lb.wire_w, lb.wire_h);
+    let u = (vx as f64 + 0.5 - lb.off_x as f64) / lb.scale;
+    let v = (vy as f64 + 0.5 - lb.off_y as f64) / lb.scale;
     let src_ix = u.floor().clamp(0.0, (lb.src_w.saturating_sub(1)) as f64) as u32;
     let src_iy = v.floor().clamp(0.0, (lb.src_h.saturating_sub(1)) as f64) as u32;
     let bpp = format.bytes_per_pixel().max(3);

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use ssh2::Session;
 
 use crate::config::{Auth, Config};
+use crate::orientation::Orientation;
 
 pub const REMOTE_CLIENT_PATH: &str = "/tmp/rm-client-screen";
 
@@ -249,6 +250,7 @@ pub fn remote_screen_command(
     connect_port: u16,
     src_w: u32,
     src_h: u32,
+    orientation: Orientation,
     shim: Option<&FbShim>,
 ) -> String {
     let env_prefix = match shim {
@@ -258,9 +260,17 @@ pub fn remote_screen_command(
         Some(FbShim::Rm2fb(path)) => format!("LD_PRELOAD={path} "),
         None => String::new(),
     };
+    // Orientation is always passed as the 6th argv (after SRC_W/H) so AppLoad / wrappers that
+    // strip custom environment variables still receive it. RM_PAD_ORIENTATION remains for manual runs.
+    let orient_env = format!("RM_PAD_ORIENTATION={} ", orientation);
     format!(
-        "RUST_LOG=info {env_prefix}exec {} {} {} {} {} 2>/tmp/rm-client-screen.log",
-        REMOTE_CLIENT_PATH, connect_host, connect_port, src_w, src_h,
+        "RUST_LOG=info {env_prefix}{orient_env}exec {} {} {} {} {} {} 2>/tmp/rm-client-screen.log",
+        REMOTE_CLIENT_PATH,
+        connect_host,
+        connect_port,
+        src_w,
+        src_h,
+        orientation,
     )
 }
 
@@ -279,34 +289,46 @@ pub fn ensure_appload_manifest(
     port: u16,
     src_w: u32,
     src_h: u32,
+    orientation: Orientation,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (preload, extra_env) = match shim {
-        FbShim::QtfbShim(path) => (
-            path.as_str(),
-            r#",
+    let qtfb_env = match shim {
+        FbShim::QtfbShim(_) => r#",
     "QTFB_SHIM_MODEL": "0",
     "QTFB_SHIM_INPUT_MODE": "NATIVE",
     "LIBREMARKABLE_FB_DISFAVOR_INTERNAL_RM2FB": "1""#,
-        ),
-        FbShim::Rm2fb(path) => (path.as_str(), ""),
+        FbShim::Rm2fb(_) => "",
+    };
+    let preload = match shim {
+        FbShim::QtfbShim(path) | FbShim::Rm2fb(path) => path.as_str(),
     };
 
     let manifest = format!(
         r#"{{
   "name": "Screen Mirror",
   "application": "{}",
-  "args": ["{}", "{}", "{}", "{}"],
+  "args": ["{}", "{}", "{}", "{}", "{}"],
   "environment": {{
     "LD_PRELOAD": "{}",
-    "RUST_LOG": "info"{}
+    "RUST_LOG": "info",
+    "RM_PAD_ORIENTATION": "{}"{}
   }},
   "qtfb": true
 }}"#,
-        REMOTE_CLIENT_PATH, host, port, src_w, src_h, preload, extra_env,
+        REMOTE_CLIENT_PATH,
+        host,
+        port,
+        src_w,
+        src_h,
+        orientation,
+        preload,
+        orientation,
+        qtfb_env,
     );
 
+    // Write via temp file + atomic mv so AppLoad / inotify see a replace (overwriting in place
+    // sometimes leaves stale launcher cache until the JSON is deleted manually).
     let cmd = format!(
-        "mkdir -p {dir} && cat > {dir}/external.manifest.json",
+        "mkdir -p {dir} && cat > {dir}/external.manifest.json.tmp && mv -f {dir}/external.manifest.json.tmp {dir}/external.manifest.json",
         dir = APPLOAD_APP_DIR,
     );
     let mut channel = session.channel_session()?;

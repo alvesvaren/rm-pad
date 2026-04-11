@@ -84,6 +84,153 @@ impl Orientation {
             Orientation::Portrait | Orientation::Inverted => (y_max, x_max),
         }
     }
+
+    /// Clockwise quarter turns around the framebuffer center for screen mirroring (before any
+    /// [`Self::mirror_landscape_left_flip_y`]).
+    ///
+    /// **Both** landscape modes use **one** quarter turn from portrait wire layout so the panel
+    /// long edge matches the desktop horizontal axis. They differ only by a vertical mirror; see
+    /// [`Self::mirror_landscape_left_flip_y`].
+    pub const fn mirror_quarter_turns_cw(self) -> u8 {
+        match self {
+            Orientation::Portrait => 0,
+            Orientation::LandscapeRight | Orientation::LandscapeLeft => 1,
+            Orientation::Inverted => 2,
+        }
+    }
+
+    /// After rotation, mirror framebuffer **Y** so landscape-left matches rm-pad (buttons-left hold)
+    /// vs landscape-right.
+    pub const fn mirror_landscape_left_flip_y(self) -> bool {
+        matches!(self, Orientation::LandscapeLeft)
+    }
+
+    /// Width × height used to **contain** the host capture when letterboxing.
+    ///
+    /// Landscape holds use the panel’s long side as the logical horizontal axis, so the fit
+    /// rectangle is transposed relative to mmap order (`fb_w` × `fb_h`).
+    pub const fn mirror_letterbox_fit_dimensions(self, fb_w: u32, fb_h: u32) -> (u32, u32) {
+        match self {
+            Orientation::Portrait | Orientation::Inverted => (fb_w, fb_h),
+            Orientation::LandscapeRight | Orientation::LandscapeLeft => (fb_h, fb_w),
+        }
+    }
+}
+
+#[inline]
+fn rotate_vec_k_times(mut px: f64, mut py: f64, k: u8) -> (f64, f64) {
+    for _ in 0..(k % 4) {
+        let nx = -py;
+        let ny = px;
+        px = nx;
+        py = ny;
+    }
+    (px, py)
+}
+
+/// Wire / mmap pixel → physical draw pixel (same transform the tablet uses when placing patches).
+pub fn mirror_wire_to_physical(
+    wire_x: u32,
+    wire_y: u32,
+    orientation: Orientation,
+    fb_w: u32,
+    fb_h: u32,
+) -> (u32, u32) {
+    let k = orientation.mirror_quarter_turns_cw() % 4;
+    if k == 0 && !orientation.mirror_landscape_left_flip_y() {
+        return (
+            wire_x.min(fb_w.saturating_sub(1)),
+            wire_y.min(fb_h.saturating_sub(1)),
+        );
+    }
+    let c_wx = fb_w as f64 / 2.0;
+    let c_wy = fb_h as f64 / 2.0;
+    let mut px = wire_x as f64 + 0.5 - c_wx;
+    let mut py = wire_y as f64 + 0.5 - c_wy;
+    let (rx, ry) = rotate_vec_k_times(px, py, k);
+    px = rx;
+    py = ry;
+    let max_x = fb_w.saturating_sub(1) as f64;
+    let max_y = fb_h.saturating_sub(1) as f64;
+    let ox = (px + c_wx - 0.5).round().clamp(0.0, max_x) as u32;
+    let mut oy = (py + c_wy - 0.5).round().clamp(0.0, max_y) as u32;
+    if orientation.mirror_landscape_left_flip_y() {
+        oy = fb_h.saturating_sub(1).saturating_sub(oy);
+    }
+    (ox, oy)
+}
+
+/// Wire / protocol pixel (mmap order) → letterbox **view** pixel (`fit_w` × `fit_h`).
+pub fn mirror_wire_pixel_to_view(
+    wire_x: u32,
+    wire_y: u32,
+    orientation: Orientation,
+    wire_w: u32,
+    wire_h: u32,
+) -> (u32, u32) {
+    let k = orientation.mirror_quarter_turns_cw() % 4;
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(wire_w, wire_h);
+    if k == 0 && !orientation.mirror_landscape_left_flip_y() {
+        return (
+            wire_x.min(fit_w.saturating_sub(1)),
+            wire_y.min(fit_h.saturating_sub(1)),
+        );
+    }
+    let c_vx = fit_w as f64 / 2.0;
+    let c_vy = fit_h as f64 / 2.0;
+    let c_wx = wire_w as f64 / 2.0;
+    let c_wy = wire_h as f64 / 2.0;
+    let mut px = wire_x as f64 + 0.5 - c_wx;
+    let mut py = wire_y as f64 + 0.5 - c_wy;
+    let (rx, ry) = rotate_vec_k_times(px, py, k);
+    px = rx;
+    py = ry;
+    let max_x = fit_w.saturating_sub(1) as f64;
+    let max_y = fit_h.saturating_sub(1) as f64;
+    let vx = (px + c_vx - 0.5).round().clamp(0.0, max_x) as u32;
+    let mut vy = (py + c_vy - 0.5).round().clamp(0.0, max_y) as u32;
+    if orientation.mirror_landscape_left_flip_y() {
+        vy = fit_h.saturating_sub(1).saturating_sub(vy);
+    }
+    (vx, vy)
+}
+
+/// View / letterbox pixel → wire / mmap pixel (inverse of [`mirror_wire_pixel_to_view`]).
+pub fn mirror_view_pixel_to_wire(
+    view_x: u32,
+    view_y: u32,
+    orientation: Orientation,
+    wire_w: u32,
+    wire_h: u32,
+) -> (u32, u32) {
+    let k = orientation.mirror_quarter_turns_cw() % 4;
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(wire_w, wire_h);
+    let mut view_y = view_y;
+    if orientation.mirror_landscape_left_flip_y() {
+        view_y = fit_h.saturating_sub(1).saturating_sub(view_y);
+    }
+    if k == 0 {
+        return (
+            view_x.min(wire_w.saturating_sub(1)),
+            view_y.min(wire_h.saturating_sub(1)),
+        );
+    }
+    let c_vx = fit_w as f64 / 2.0;
+    let c_vy = fit_h as f64 / 2.0;
+    let c_wx = wire_w as f64 / 2.0;
+    let c_wy = wire_h as f64 / 2.0;
+    let mut px = view_x as f64 + 0.5 - c_vx;
+    let mut py = view_y as f64 + 0.5 - c_vy;
+    // wire_vec = F^{-k} view_vec  →  apply (4−k) forward quarter-turns (same as F^k inverse in Z_4).
+    let steps = (4 - k) % 4;
+    let (rx, ry) = rotate_vec_k_times(px, py, steps);
+    px = rx;
+    py = ry;
+    let max_x = wire_w.saturating_sub(1) as f64;
+    let max_y = wire_h.saturating_sub(1) as f64;
+    let wx = (px + c_wx - 0.5).round().clamp(0.0, max_x) as u32;
+    let wy = (py + c_wy - 0.5).round().clamp(0.0, max_y) as u32;
+    (wx, wy)
 }
 
 impl fmt::Display for Orientation {
@@ -142,5 +289,51 @@ mod tests {
         assert_eq!("landscape-right".parse::<Orientation>().unwrap(), Orientation::LandscapeRight);
         assert_eq!("landscape_left".parse::<Orientation>().unwrap(), Orientation::LandscapeLeft);
         assert!("invalid".parse::<Orientation>().is_err());
+    }
+
+    #[test]
+    fn mirror_quarter_turns_for_portrait_framebuffer_wire() {
+        assert_eq!(Orientation::Portrait.mirror_quarter_turns_cw(), 0);
+        assert_eq!(Orientation::LandscapeRight.mirror_quarter_turns_cw(), 1);
+        assert_eq!(Orientation::LandscapeLeft.mirror_quarter_turns_cw(), 1);
+        assert!(!Orientation::LandscapeRight.mirror_landscape_left_flip_y());
+        assert!(Orientation::LandscapeLeft.mirror_landscape_left_flip_y());
+        assert_eq!(Orientation::Inverted.mirror_quarter_turns_cw(), 2);
+    }
+
+    #[test]
+    fn mirror_view_wire_roundtrip_landscape_right() {
+        let o = Orientation::LandscapeRight;
+        let (fw, fh) = (1404u32, 1872u32);
+        let (fit_w, fit_h) = o.mirror_letterbox_fit_dimensions(fw, fh);
+        assert_eq!((fit_w, fit_h), (1872, 1404));
+        for wx in [0u32, 100, 703, 1403] {
+            for wy in [0u32, 200, 936, 1871] {
+                let (vx, vy) = mirror_wire_pixel_to_view(wx, wy, o, fw, fh);
+                let (wx2, wy2) = mirror_view_pixel_to_wire(vx, vy, o, fw, fh);
+                assert!(
+                    wx2.abs_diff(wx) <= 1 && wy2.abs_diff(wy) <= 1,
+                    "wire ({wx},{wy}) -> view ({vx},{vy}) -> wire ({wx2},{wy2})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mirror_view_wire_roundtrip_landscape_left() {
+        let o = Orientation::LandscapeLeft;
+        let (fw, fh) = (1404u32, 1872u32);
+        let (fit_w, fit_h) = o.mirror_letterbox_fit_dimensions(fw, fh);
+        assert_eq!((fit_w, fit_h), (1872, 1404));
+        for wx in [0u32, 100, 703, 1403] {
+            for wy in [0u32, 200, 936, 1871] {
+                let (vx, vy) = mirror_wire_pixel_to_view(wx, wy, o, fw, fh);
+                let (wx2, wy2) = mirror_view_pixel_to_wire(vx, vy, o, fw, fh);
+                assert!(
+                    wx2.abs_diff(wx) <= 1 && wy2.abs_diff(wy) <= 1,
+                    "wire ({wx},{wy}) -> view ({vx},{vy}) -> wire ({wx2},{wy2})"
+                );
+            }
+        }
     }
 }

@@ -1,8 +1,10 @@
 //! Tablet-side receiver: TCP → LZ4 → framebuffer partial updates.
 //!
-//! Run as `rm-client-screen [HOST] [PORT] [SRC_W SRC_H]` (defaults `127.0.0.1` `9876`).
+//! Run as `rm-client-screen [HOST] [PORT] [SRC_W SRC_H [ORIENTATION]]` (defaults `127.0.0.1` `9876`).
 //! SRC_W/SRC_H are the host capture size (e.g. 1920×1200); regions are letterboxed to fit
-//! the device framebuffer. `rm-screen` passes these automatically.
+//! the device framebuffer. **ORIENTATION** must match rm-pad (`portrait`, `landscape-right`,
+//! `landscape-left`, `inverted`). **`rm-screen` always passes it as the 6th argument** when
+//! launching the client; `RM_PAD_ORIENTATION` is still read if that argument is omitted (manual runs).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -17,6 +19,9 @@ use libremarkable::framebuffer::core::Framebuffer;
 use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefreshMode};
 use log::{error, info, warn};
 use rm_common::expand_rect_to_epdc_grid;
+use rm_common::orientation::{
+    mirror_view_pixel_to_wire, mirror_wire_pixel_to_view, mirror_wire_to_physical, Orientation,
+};
 use rm_common::protocol::{UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -26,7 +31,7 @@ const IDLE_MS: i32 = 3000;
 fn main() -> DynResult<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let (addr, source_dims) = parse_args()?;
+    let (addr, source_dims, orientation_from_argv) = parse_args()?;
 
     let mut stream = TcpStream::connect(&addr)?;
     info!("rm-client-screen connected to {}", addr);
@@ -60,20 +65,46 @@ fn main() -> DynResult<()> {
         }
     };
 
-    let scale = (fb_w as f64 / src_w as f64).min(fb_h as f64 / src_h as f64);
+    let orientation_cli = orientation_from_argv;
+    let orient_from_argv = orientation_cli.is_some();
+    let orientation = orientation_cli.unwrap_or_else(|| {
+        std::env::var("RM_PAD_ORIENTATION")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<Orientation>().ok())
+            .unwrap_or(Orientation::LandscapeRight)
+    });
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(fb_w, fb_h);
+    let scale = (fit_w as f64 / src_w as f64).min(fit_h as f64 / src_h as f64);
     let dst_fit_w = ((src_w as f64 * scale).floor() as u32) & !1;
     let dst_fit_h = (src_h as f64 * scale).floor() as u32;
-    let off_x = fb_w.saturating_sub(dst_fit_w) / 2;
-    let off_y = fb_h.saturating_sub(dst_fit_h) / 2;
+    let off_x = fit_w.saturating_sub(dst_fit_w) / 2;
+    let off_y = fit_h.saturating_sub(dst_fit_h) / 2;
 
     info!(
-        "framebuffer {}×{}, host capture {}×{} — scale {:.4} letterbox offset ({}, {}) fitted {}×{}",
-        fb_w, fb_h, src_w, src_h, scale, off_x, off_y, dst_fit_w, dst_fit_h
+        "framebuffer {}×{}, host capture {}×{} — orientation={} fit {}×{} scale {:.4} offset ({}, {}) fitted {}×{}",
+        fb_w, fb_h, src_w, src_h, orientation, fit_w, fit_h, scale, off_x, off_y, dst_fit_w, dst_fit_h
     );
     info!(
         "EPD line_length={} bpp={} (RM2: buffer is usually /dev/shm/swtfb.01 + imx epdc; updates go via MXCFB_SEND_UPDATE / rm2fb)",
         fb.fix_screen_info.line_length,
         fb.var_screen_info.bits_per_pixel
+    );
+
+    let quarter_turns = orientation.mirror_quarter_turns_cw();
+    let orient_source = if orient_from_argv {
+        "argv (set by rm-screen)"
+    } else if std::env::var("RM_PAD_ORIENTATION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        "RM_PAD_ORIENTATION"
+    } else {
+        "default (landscape-right); prefer argv from rm-screen"
+    };
+    info!(
+        "mirror orientation: {orientation} — quarter turns CW = {quarter_turns} (source: {orient_source})",
     );
 
     // Native pen ink uses async-style updates; `Wait` adds ~1 EPDC frame time per mirror patch.
@@ -103,6 +134,7 @@ fn main() -> DynResult<()> {
         &mut stream,
         fb_w,
         fb_h,
+        orientation,
         scale,
         off_x,
         off_y,
@@ -113,28 +145,45 @@ fn main() -> DynResult<()> {
     Ok(())
 }
 
-fn parse_args() -> DynResult<(String, Option<(u32, u32)>)> {
+fn parse_args() -> DynResult<(String, Option<(u32, u32)>, Option<Orientation>)> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.len() {
-        0 => Ok(("127.0.0.1:9876".to_string(), None)),
+        0 => Ok(("127.0.0.1:9876".to_string(), None, None)),
         1 => {
             if argv[0].contains(':') {
-                Ok((argv[0].clone(), None))
+                Ok((argv[0].clone(), None, None))
             } else {
-                Err("usage: rm-client-screen HOST PORT [SRC_W SRC_H]".into())
+                Err(
+                    "usage: rm-client-screen HOST PORT [SRC_W SRC_H [ORIENTATION]]".into(),
+                )
             }
         }
         2 => {
             let port: u16 = argv[1].parse().map_err(|_| "PORT must be a number")?;
-            Ok((format!("{}:{}", argv[0], port), None))
+            Ok((format!("{}:{}", argv[0], port), None, None))
         }
         4 => {
             let port: u16 = argv[1].parse().map_err(|_| "PORT must be a number")?;
             let sw: u32 = argv[2].parse().map_err(|_| "SRC_W must be u32")?;
             let sh: u32 = argv[3].parse().map_err(|_| "SRC_H must be u32")?;
-            Ok((format!("{}:{}", argv[0], port), Some((sw, sh))))
+            Ok((format!("{}:{}", argv[0], port), Some((sw, sh)), None))
         }
-        _ => Err("usage: rm-client-screen HOST PORT [SRC_W SRC_H]".into()),
+        5 => {
+            let port: u16 = argv[1].parse().map_err(|_| "PORT must be a number")?;
+            let sw: u32 = argv[2].parse().map_err(|_| "SRC_W must be u32")?;
+            let sh: u32 = argv[3].parse().map_err(|_| "SRC_H must be u32")?;
+            let orientation = argv[4]
+                .parse::<Orientation>()
+                .map_err(|e| format!("ORIENTATION: {e}"))?;
+            Ok((
+                format!("{}:{}", argv[0], port),
+                Some((sw, sh)),
+                Some(orientation),
+            ))
+        }
+        _ => Err(
+            "usage: rm-client-screen [HOST:PORT | HOST PORT [SRC_W SRC_H [ORIENTATION]]]".into(),
+        ),
     }
 }
 
@@ -143,6 +192,7 @@ fn run_stream(
     stream: &mut TcpStream,
     fb_w: u32,
     fb_h: u32,
+    orientation: Orientation,
     scale: f64,
     off_x: u32,
     off_y: u32,
@@ -205,36 +255,46 @@ fn run_stream(
                 }
             } else {
                 map_region_rgb565_to_fb(
-                    &rgb565, w, h, header.x as u32, header.y as u32,
-                    scale, off_x, off_y, fb_w, fb_h,
+                    &rgb565,
+                    w,
+                    h,
+                    header.x as u32,
+                    header.y as u32,
+                    scale,
+                    off_x,
+                    off_y,
+                    fb_w,
+                    fb_h,
+                    orientation,
                 )
             };
             if let Some((rect, patch)) = mapped {
-                if let Err(e) = write_patch_to_fb(fb, rect, &patch, fb_w, fb_h) {
-                    error!("fb write {:?}: {e}", rect);
-                } else {
-                    let al = expand_to_8px_grid(rect, fb_w, fb_h);
-                    let mode = match refresh_mode {
-                        PartialRefreshMode::Async => PartialRefreshMode::Async,
-                        PartialRefreshMode::Wait => PartialRefreshMode::Wait,
-                        PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
-                    };
-                    fb.partial_refresh(
-                        &al,
-                        mode,
-                        waveform,
-                        display_temp::TEMP_USE_REMARKABLE_DRAW,
-                        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-                        0,
-                        false,
-                    );
-
-                    updates_ok += 1;
-                    if updates_ok <= 3 {
-                        info!(
-                            "update #{updates_ok}: refresh {}×{}@({},{})",
-                            al.width, al.height, al.left, al.top,
+                match write_patch_to_fb(fb, rect, &patch, fb_w, fb_h, orientation) {
+                    Err(e) => error!("fb write {:?}: {e}", rect),
+                    Ok(None) => {}
+                    Ok(Some(al)) => {
+                        let mode = match refresh_mode {
+                            PartialRefreshMode::Async => PartialRefreshMode::Async,
+                            PartialRefreshMode::Wait => PartialRefreshMode::Wait,
+                            PartialRefreshMode::DryRun => PartialRefreshMode::DryRun,
+                        };
+                        fb.partial_refresh(
+                            &al,
+                            mode,
+                            waveform,
+                            display_temp::TEMP_USE_REMARKABLE_DRAW,
+                            dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
+                            0,
+                            false,
                         );
+
+                        updates_ok += 1;
+                        if updates_ok <= 3 {
+                            info!(
+                                "update #{updates_ok}: refresh {}×{}@({},{})",
+                                al.width, al.height, al.left, al.top,
+                            );
+                        }
                     }
                 }
             }
@@ -308,14 +368,44 @@ fn waveform_from_env() -> waveform_mode {
     }
 }
 
-/// Write a region patch to the framebuffer without triggering a refresh.
+fn rotated_rect_aabb(rect: mxcfb_rect, orientation: Orientation, fb_w: u32, fb_h: u32) -> mxcfb_rect {
+    let k = orientation.mirror_quarter_turns_cw() % 4;
+    if k == 0 && !orientation.mirror_landscape_left_flip_y() {
+        return rect;
+    }
+    let l = rect.left;
+    let t = rect.top;
+    let r = rect.left.saturating_add(rect.width).saturating_sub(1);
+    let b = rect.top.saturating_add(rect.height).saturating_sub(1);
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for (x, y) in [(l, t), (r, t), (l, b), (r, b)] {
+        let (px, py) = mirror_wire_to_physical(x, y, orientation, fb_w, fb_h);
+        min_x = min_x.min(px);
+        min_y = min_y.min(py);
+        max_x = max_x.max(px);
+        max_y = max_y.max(py);
+    }
+    mxcfb_rect {
+        left: min_x,
+        top: min_y,
+        width: max_x.saturating_sub(min_x).saturating_add(1),
+        height: max_y.saturating_sub(min_y).saturating_add(1),
+    }
+}
+
+/// Write a region patch to the framebuffer without triggering a refresh. Returns the 8×8-aligned
+/// rectangle to pass to `partial_refresh`, or `None` if nothing was written.
 fn write_patch_to_fb(
     fb: &mut Framebuffer,
     rect: mxcfb_rect,
     patch: &[u8],
     fb_w: u32,
     fb_h: u32,
-) -> Result<(), &'static str> {
+    orientation: Orientation,
+) -> Result<Option<mxcfb_rect>, &'static str> {
     let bpp = 2usize;
     let expect = (rect.width as usize)
         .checked_mul(rect.height as usize)
@@ -325,34 +415,72 @@ fn write_patch_to_fb(
         return Err("patch length does not match rect");
     }
 
-    let al = expand_to_8px_grid(rect, fb_w, fb_h);
-    if al.width < 2 || al.height < 1 {
-        return Ok(());
+    let k = orientation.mirror_quarter_turns_cw() % 4;
+    let needs_scatter = k != 0 || orientation.mirror_landscape_left_flip_y();
+
+    if !needs_scatter {
+        let al = expand_to_8px_grid(rect, fb_w, fb_h);
+        if al.width < 2 || al.height < 1 {
+            return Ok(None);
+        }
+
+        // Host pre-aligns to this grid; skip dump_region + merge (saves a full framebuffer read).
+        if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
+        {
+            fb.restore_region(al, patch)?;
+            return Ok(Some(al));
+        }
+
+        let mut canvas = fb.dump_region(al)?;
+        let row_patch = rect.width as usize * bpp;
+        let row_canvas = al.width as usize * bpp;
+        let ox = (rect.left.saturating_sub(al.left)) as usize * bpp;
+        let oy = rect.top.saturating_sub(al.top) as usize;
+        for row in 0..rect.height as usize {
+            let dst = (oy + row) * row_canvas + ox;
+            let src = row * row_patch;
+            canvas[dst..dst + row_patch].copy_from_slice(&patch[src..src + row_patch]);
+        }
+
+        fb.restore_region(al, &canvas)?;
+        return Ok(Some(al));
     }
 
-    // Host pre-aligns to this grid; skip dump_region + merge (saves a full framebuffer read).
-    if al.left == rect.left && al.top == rect.top && al.width == rect.width && al.height == rect.height
-    {
-        fb.restore_region(al, patch)?;
-        return Ok(());
+    let loose = rotated_rect_aabb(rect, orientation, fb_w, fb_h);
+    let al = expand_to_8px_grid(loose, fb_w, fb_h);
+    if al.width < 2 || al.height < 1 {
+        return Ok(None);
     }
 
     let mut canvas = fb.dump_region(al)?;
-    let row_patch = rect.width as usize * bpp;
     let row_canvas = al.width as usize * bpp;
-    let ox = (rect.left.saturating_sub(al.left)) as usize * bpp;
-    let oy = rect.top.saturating_sub(al.top) as usize;
+    let row_patch = rect.width as usize * bpp;
+
     for row in 0..rect.height as usize {
-        let dst = (oy + row) * row_canvas + ox;
-        let src = row * row_patch;
-        canvas[dst..dst + row_patch].copy_from_slice(&patch[src..src + row_patch]);
+        for col in 0..rect.width as usize {
+            let wire_x = rect.left + col as u32;
+            let wire_y = rect.top + row as u32;
+            let (px, py) = mirror_wire_to_physical(wire_x, wire_y, orientation, fb_w, fb_h);
+            if px < al.left
+                || py < al.top
+                || px >= al.left.saturating_add(al.width)
+                || py >= al.top.saturating_add(al.height)
+            {
+                continue;
+            }
+            let ox = (px.saturating_sub(al.left)) as usize * bpp;
+            let oy = (py.saturating_sub(al.top)) as usize;
+            let di = oy * row_canvas + ox;
+            let si = row * row_patch + col * bpp;
+            canvas[di..di + bpp].copy_from_slice(&patch[si..si + bpp]);
+        }
     }
 
     fb.restore_region(al, &canvas)?;
-    Ok(())
+    Ok(Some(al))
 }
 
-/// Map a source RGB565 patch (sw×sh at compositor coords sx,sy) into device framebuffer space.
+/// Map a source RGB565 patch (sw×sh at compositor coords sx,sy) into wire framebuffer space.
 fn map_region_rgb565_to_fb(
     rgb565: &[u8],
     sw: u32,
@@ -364,23 +492,46 @@ fn map_region_rgb565_to_fb(
     off_y: u32,
     fb_w: u32,
     fb_h: u32,
+    orientation: Orientation,
 ) -> Option<(mxcfb_rect, Vec<u8>)> {
     if sw == 0 || sh == 0 {
         return None;
     }
 
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(fb_w, fb_h);
     let dx0 = off_x as f64 + sx as f64 * scale;
     let dy0 = off_y as f64 + sy as f64 * scale;
     let dx1 = dx0 + sw as f64 * scale;
     let dy1 = dy0 + sh as f64 * scale;
 
-    let ix0 = dx0.floor().max(0.0) as u32;
-    let iy0 = dy0.floor().max(0.0) as u32;
-    let ix1 = dx1.ceil().min(fb_w as f64) as u32;
-    let iy1 = dy1.ceil().min(fb_h as f64) as u32;
-
-    let out_w = ix1.saturating_sub(ix0);
-    let out_h = iy1.saturating_sub(iy0);
+    let ixv0 = dx0.floor().max(0.0) as u32;
+    let iyv0 = dy0.floor().max(0.0) as u32;
+    let ixv1 = dx1.ceil().min(fit_w as f64) as u32;
+    let iyv1 = dy1.ceil().min(fit_h as f64) as u32;
+    if ixv0 >= ixv1 || iyv0 >= iyv1 {
+        return None;
+    }
+    let x1m = ixv1.saturating_sub(1);
+    let y1m = iyv1.saturating_sub(1);
+    let corners = [
+        (ixv0, iyv0),
+        (x1m, iyv0),
+        (ixv0, y1m),
+        (x1m, y1m),
+    ];
+    let mut ix0 = u32::MAX;
+    let mut iy0 = u32::MAX;
+    let mut ix1 = 0u32;
+    let mut iy1 = 0u32;
+    for (vx, vy) in corners {
+        let (wx, wy) = mirror_view_pixel_to_wire(vx, vy, orientation, fb_w, fb_h);
+        ix0 = ix0.min(wx);
+        iy0 = iy0.min(wy);
+        ix1 = ix1.max(wx);
+        iy1 = iy1.max(wy);
+    }
+    let out_w = ix1.saturating_sub(ix0).saturating_add(1);
+    let out_h = iy1.saturating_sub(iy0).saturating_add(1);
     let out_w = out_w & !1;
     if out_w < 2 || out_h < 1 {
         return None;
@@ -392,8 +543,9 @@ fn map_region_rgb565_to_fb(
         let screen_y = iy0 + iy;
         for ix in 0..out_w {
             let screen_x = ix0 + ix;
-            let u = (screen_x as f64 + 0.5 - off_x as f64) / scale - sx as f64;
-            let v = (screen_y as f64 + 0.5 - off_y as f64) / scale - sy as f64;
+            let (vx, vy) = mirror_wire_pixel_to_view(screen_x, screen_y, orientation, fb_w, fb_h);
+            let u = (vx as f64 + 0.5 - off_x as f64) / scale - sx as f64;
+            let v = (vy as f64 + 0.5 - off_y as f64) / scale - sy as f64;
             let src_ix = u.floor().clamp(0.0, (sw - 1) as f64) as u32;
             let src_iy = v.floor().clamp(0.0, (sh - 1) as f64) as u32;
             let si = ((src_iy * sw + src_ix) * 2) as usize;
