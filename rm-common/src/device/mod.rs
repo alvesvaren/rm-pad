@@ -7,7 +7,8 @@ mod detect_ssh;
 pub use rm2::RM2;
 pub use rmpp::RMPP;
 
-/// Device-specific parameters for input handling.
+/// Device-specific parameters for input handling (`rm-pad` reads pen/touch evdev using these ranges;
+/// touch `ABS_MT_POSITION_*` clamps and `transform_touch` / `transform_pen` are in `orientation`).
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceProfile {
     #[allow(dead_code)]

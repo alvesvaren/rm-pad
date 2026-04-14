@@ -1,4 +1,15 @@
 //! Screen orientation handling for input coordinate transforms.
+//!
+//! **Frames:** Touch and the on-screen framebuffer use the same **portrait wire** pixel grid on RM2
+//! (short edge = X, long = Y; see `device::rm2`). The pen digitizer is **90°** to that in raw evdev
+//! (`pen_x_max > pen_y_max`); [`Orientation::transform_pen`] corrects for host output. **Screen
+//! mirror** wire protocol and `mirror_wire_pixel_to_view` must follow the **touch / framebuffer**
+//! convention, not pen-native identity.
+//!
+//! **Mirroring:** The tablet shim exposes a **portrait** buffer; `mirror_wire_pixel_to_view` /
+//! `mirror_view_pixel_to_wire` encode how `rm-screen` samples the host capture into that grid for
+//! each [`Orientation`]. `rm-client-screen` blits those wire rectangles with **no extra rotation**
+//! (only an mmap transpose if `var_screen_info` dimensions are swapped vs wire).
 
 use serde::Deserialize;
 use std::fmt;

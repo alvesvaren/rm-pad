@@ -60,6 +60,8 @@ impl SlotState {
         }
     }
 
+    /// Raw `(x, y)` are `ABS_MT_POSITION_*` in the device’s native grid (`touch_x_max` × `touch_y_max`,
+    /// short × long on RM2 — same convention as `DeviceProfile::framebuffer_size` / screen mirror wire).
     fn get_primary_position(&self, device: &DeviceProfile, orientation: Orientation) -> Option<(i32, i32)> {
         (0..MT_SLOTS)
             .find(|&s| self.active[s])

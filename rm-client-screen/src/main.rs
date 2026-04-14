@@ -5,6 +5,24 @@
 //! the device framebuffer. **ORIENTATION** must match rm-pad (`portrait`, `landscape-right`,
 //! `landscape-left`, `inverted`). **`rm-screen` always passes it as the 6th argument** when
 //! launching the client; `RM_PAD_ORIENTATION` is still read if that argument is omitted (manual runs).
+//!
+//! **Canonical wire** uses `min(var.xres,yres) × max(...)` so it matches the touch/framebuffer
+//! portrait grid (`rm_common::device` / rm-screen letterbox) when `var_screen_info` is transposed.
+//!
+//! **Portrait buffer, host rotation:** The qtfb/rm2fb shim exposes a **portrait** framebuffer
+//! (short×long in row-major). There is no kernel “orientation” for mirroring — `rm-screen` already
+//! folds `--orientation` into each wire pixel when encoding (see `mirror_wire_pixel_to_view`). This
+//! client **must not** rotate again: it blits patch rows as **wire** coordinates, only applying
+//! [`protocol_point_to_mmap`] when `xres×yres` is transposed vs wire.
+//!
+//! **Observed on stock OS + qtfb-shim (e.g. 3.26 xovi debug):** Qt reports touch `max X: 1403`,
+//! `max Y: 1871` on `/dev/input/event2`. When AppLoad starts this client, `[QTFB]` logs
+//! `Resolution is set to 1404x1872`, SHM size `5256576` (= 1404×1872×2), and an image with
+//! `bpl = 2808` (= `xres`×2 for 16bpp). That matches `libremarkable`’s `var_screen_info` /
+//! `fix_screen_info.line_length` in the successful session (`EPD line_length=2808`).
+//!
+//! **TCP `Connection refused`:** the PC must be listening on the configured host:port *before*
+//! launching Screen Mirror from AppLoad (start `rm-screen` and any SSH reverse tunnel first).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -20,7 +38,7 @@ use libremarkable::framebuffer::{FramebufferIO, FramebufferRefresh, PartialRefre
 use log::{error, info, warn};
 use rm_common::expand_rect_to_epdc_grid;
 use rm_common::orientation::{
-    mirror_view_pixel_to_wire, mirror_wire_pixel_to_view, mirror_wire_to_physical, Orientation,
+    mirror_view_pixel_to_wire, mirror_wire_pixel_to_view, Orientation,
 };
 use rm_common::protocol::{UpdateHeader, HEADER_SIZE, UPDATE_COORDS_FRAMEBUFFER};
 
@@ -51,17 +69,26 @@ fn main() -> DynResult<()> {
     }
 
     let mut fb = Framebuffer::new();
-    let fb_w = fb.var_screen_info.xres;
-    let fb_h = fb.var_screen_info.yres;
+    let mmap_w = fb.var_screen_info.xres as u32;
+    let mmap_h = fb.var_screen_info.yres as u32;
+    // Same convention as rm-screen `DeviceProfile::framebuffer_size`: portrait short × long.
+    let protocol_w = mmap_w.min(mmap_h);
+    let protocol_h = mmap_w.max(mmap_h);
+    if protocol_w != mmap_w || protocol_h != mmap_h {
+        info!(
+            "var_screen {}×{} — using canonical wire {}×{} for mirror math (transpose to mmap when blitting)",
+            mmap_w, mmap_h, protocol_w, protocol_h
+        );
+    }
 
     let (src_w, src_h) = match source_dims {
         Some((w, h)) if w > 0 && h > 0 => (w, h),
         _ => {
             warn!(
-                "no valid SRC_W SRC_H; assuming source equals device {}×{} (wrong unless resolutions match)",
-                fb_w, fb_h
+                "no valid SRC_W SRC_H; assuming source equals protocol wire {}×{} (wrong unless resolutions match)",
+                protocol_w, protocol_h
             );
-            (fb_w, fb_h)
+            (protocol_w, protocol_h)
         }
     };
 
@@ -74,7 +101,7 @@ fn main() -> DynResult<()> {
             .and_then(|s| s.parse::<Orientation>().ok())
             .unwrap_or(Orientation::LandscapeRight)
     });
-    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(fb_w, fb_h);
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(protocol_w, protocol_h);
     let scale = (fit_w as f64 / src_w as f64).min(fit_h as f64 / src_h as f64);
     let dst_fit_w = ((src_w as f64 * scale).floor() as u32) & !1;
     let dst_fit_h = (src_h as f64 * scale).floor() as u32;
@@ -82,8 +109,21 @@ fn main() -> DynResult<()> {
     let off_y = fit_h.saturating_sub(dst_fit_h) / 2;
 
     info!(
-        "framebuffer {}×{}, host capture {}×{} — orientation={} fit {}×{} scale {:.4} offset ({}, {}) fitted {}×{}",
-        fb_w, fb_h, src_w, src_h, orientation, fit_w, fit_h, scale, off_x, off_y, dst_fit_w, dst_fit_h
+        "var_screen {}×{}, protocol wire {}×{}, host capture {}×{} — orientation={} fit {}×{} scale {:.4} offset ({}, {}) fitted {}×{}",
+        mmap_w,
+        mmap_h,
+        protocol_w,
+        protocol_h,
+        src_w,
+        src_h,
+        orientation,
+        fit_w,
+        fit_h,
+        scale,
+        off_x,
+        off_y,
+        dst_fit_w,
+        dst_fit_h
     );
     info!(
         "EPD line_length={} bpp={} (RM2: buffer is usually /dev/shm/swtfb.01 + imx epdc; updates go via MXCFB_SEND_UPDATE / rm2fb)",
@@ -91,7 +131,6 @@ fn main() -> DynResult<()> {
         fb.var_screen_info.bits_per_pixel
     );
 
-    let quarter_turns = orientation.mirror_quarter_turns_cw();
     let orient_source = if orient_from_argv {
         "argv (set by rm-screen)"
     } else if std::env::var("RM_PAD_ORIENTATION")
@@ -104,7 +143,7 @@ fn main() -> DynResult<()> {
         "default (landscape-right); prefer argv from rm-screen"
     };
     info!(
-        "mirror orientation: {orientation} — quarter turns CW = {quarter_turns} (source: {orient_source})",
+        "mirror orientation: {orientation} (source: {orient_source}) — host encodes rotation into portrait wire; client blits wire→mmap transpose only",
     );
 
     // Native pen ink uses async-style updates; `Wait` adds ~1 EPDC frame time per mirror patch.
@@ -132,8 +171,10 @@ fn main() -> DynResult<()> {
     run_stream(
         &mut fb,
         &mut stream,
-        fb_w,
-        fb_h,
+        protocol_w,
+        protocol_h,
+        mmap_w,
+        mmap_h,
         orientation,
         scale,
         off_x,
@@ -190,8 +231,10 @@ fn parse_args() -> DynResult<(String, Option<(u32, u32)>, Option<Orientation>)> 
 fn run_stream(
     fb: &mut Framebuffer,
     stream: &mut TcpStream,
-    fb_w: u32,
-    fb_h: u32,
+    protocol_w: u32,
+    protocol_h: u32,
+    mmap_w: u32,
+    mmap_h: u32,
     orientation: Orientation,
     scale: f64,
     off_x: u32,
@@ -263,13 +306,22 @@ fn run_stream(
                     scale,
                     off_x,
                     off_y,
-                    fb_w,
-                    fb_h,
+                    protocol_w,
+                    protocol_h,
                     orientation,
                 )
             };
             if let Some((rect, patch)) = mapped {
-                match write_patch_to_fb(fb, rect, &patch, fb_w, fb_h, orientation) {
+                match write_patch_to_fb(
+                    fb,
+                    rect,
+                    &patch,
+                    protocol_w,
+                    protocol_h,
+                    mmap_w,
+                    mmap_h,
+                    orientation,
+                ) {
                     Err(e) => error!("fb write {:?}: {e}", rect),
                     Ok(None) => {}
                     Ok(Some(al)) => {
@@ -357,6 +409,27 @@ fn drain_available(stream: &mut TcpStream, buf: &mut Vec<u8>) {
     }
 }
 
+/// Map protocol **portrait wire** coordinates (short×long on RM2) to `var_screen_info` row-major
+/// addresses. Identity when `xres×yres` matches wire; when the kernel swaps dimensions, use `(py, px)`
+/// so mmap indexing matches `line_length`.
+#[inline]
+fn protocol_point_to_mmap(
+    px: u32,
+    py: u32,
+    protocol_w: u32,
+    protocol_h: u32,
+    mmap_w: u32,
+    mmap_h: u32,
+) -> (u32, u32) {
+    if protocol_w == mmap_w && protocol_h == mmap_h {
+        (px, py)
+    } else if protocol_w == mmap_h && protocol_h == mmap_w {
+        (py, px)
+    } else {
+        (px, py)
+    }
+}
+
 fn waveform_from_env() -> waveform_mode {
     match std::env::var("RM_CLIENT_SCREEN_WAVEFORM").as_deref() {
         Ok(s) if s.eq_ignore_ascii_case("gc16") => waveform_mode::WAVEFORM_MODE_GC16,
@@ -368,9 +441,15 @@ fn waveform_from_env() -> waveform_mode {
     }
 }
 
-fn rotated_rect_aabb(rect: mxcfb_rect, orientation: Orientation, fb_w: u32, fb_h: u32) -> mxcfb_rect {
-    let k = orientation.mirror_quarter_turns_cw() % 4;
-    if k == 0 && !orientation.mirror_landscape_left_flip_y() {
+/// Bounding box in mmap space for a wire-rectangle update (transpose only; no orientation rotation).
+fn wire_rect_to_mmap_aabb(
+    rect: mxcfb_rect,
+    protocol_w: u32,
+    protocol_h: u32,
+    mmap_w: u32,
+    mmap_h: u32,
+) -> mxcfb_rect {
+    if protocol_w == mmap_w && protocol_h == mmap_h {
         return rect;
     }
     let l = rect.left;
@@ -382,11 +461,11 @@ fn rotated_rect_aabb(rect: mxcfb_rect, orientation: Orientation, fb_w: u32, fb_h
     let mut max_x = 0u32;
     let mut max_y = 0u32;
     for (x, y) in [(l, t), (r, t), (l, b), (r, b)] {
-        let (px, py) = mirror_wire_to_physical(x, y, orientation, fb_w, fb_h);
-        min_x = min_x.min(px);
-        min_y = min_y.min(py);
-        max_x = max_x.max(px);
-        max_y = max_y.max(py);
+        let (mx, my) = protocol_point_to_mmap(x, y, protocol_w, protocol_h, mmap_w, mmap_h);
+        min_x = min_x.min(mx);
+        min_y = min_y.min(my);
+        max_x = max_x.max(mx);
+        max_y = max_y.max(my);
     }
     mxcfb_rect {
         left: min_x,
@@ -402,9 +481,11 @@ fn write_patch_to_fb(
     fb: &mut Framebuffer,
     rect: mxcfb_rect,
     patch: &[u8],
-    fb_w: u32,
-    fb_h: u32,
-    orientation: Orientation,
+    protocol_w: u32,
+    protocol_h: u32,
+    mmap_w: u32,
+    mmap_h: u32,
+    _orientation: Orientation,
 ) -> Result<Option<mxcfb_rect>, &'static str> {
     let bpp = 2usize;
     let expect = (rect.width as usize)
@@ -415,11 +496,10 @@ fn write_patch_to_fb(
         return Err("patch length does not match rect");
     }
 
-    let k = orientation.mirror_quarter_turns_cw() % 4;
-    let needs_scatter = k != 0 || orientation.mirror_landscape_left_flip_y();
+    let mmap_transpose = !(protocol_w == mmap_w && protocol_h == mmap_h);
 
-    if !needs_scatter {
-        let al = expand_to_8px_grid(rect, fb_w, fb_h);
+    if !mmap_transpose {
+        let al = expand_to_8px_grid(rect, mmap_w, mmap_h);
         if al.width < 2 || al.height < 1 {
             return Ok(None);
         }
@@ -446,8 +526,8 @@ fn write_patch_to_fb(
         return Ok(Some(al));
     }
 
-    let loose = rotated_rect_aabb(rect, orientation, fb_w, fb_h);
-    let al = expand_to_8px_grid(loose, fb_w, fb_h);
+    let loose = wire_rect_to_mmap_aabb(rect, protocol_w, protocol_h, mmap_w, mmap_h);
+    let al = expand_to_8px_grid(loose, mmap_w, mmap_h);
     if al.width < 2 || al.height < 1 {
         return Ok(None);
     }
@@ -460,16 +540,16 @@ fn write_patch_to_fb(
         for col in 0..rect.width as usize {
             let wire_x = rect.left + col as u32;
             let wire_y = rect.top + row as u32;
-            let (px, py) = mirror_wire_to_physical(wire_x, wire_y, orientation, fb_w, fb_h);
-            if px < al.left
-                || py < al.top
-                || px >= al.left.saturating_add(al.width)
-                || py >= al.top.saturating_add(al.height)
+            let (mx, my) = protocol_point_to_mmap(wire_x, wire_y, protocol_w, protocol_h, mmap_w, mmap_h);
+            if mx < al.left
+                || my < al.top
+                || mx >= al.left.saturating_add(al.width)
+                || my >= al.top.saturating_add(al.height)
             {
                 continue;
             }
-            let ox = (px.saturating_sub(al.left)) as usize * bpp;
-            let oy = (py.saturating_sub(al.top)) as usize;
+            let ox = (mx.saturating_sub(al.left)) as usize * bpp;
+            let oy = (my.saturating_sub(al.top)) as usize;
             let di = oy * row_canvas + ox;
             let si = row * row_patch + col * bpp;
             canvas[di..di + bpp].copy_from_slice(&patch[si..si + bpp]);
@@ -490,15 +570,15 @@ fn map_region_rgb565_to_fb(
     scale: f64,
     off_x: u32,
     off_y: u32,
-    fb_w: u32,
-    fb_h: u32,
+    protocol_w: u32,
+    protocol_h: u32,
     orientation: Orientation,
 ) -> Option<(mxcfb_rect, Vec<u8>)> {
     if sw == 0 || sh == 0 {
         return None;
     }
 
-    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(fb_w, fb_h);
+    let (fit_w, fit_h) = orientation.mirror_letterbox_fit_dimensions(protocol_w, protocol_h);
     let dx0 = off_x as f64 + sx as f64 * scale;
     let dy0 = off_y as f64 + sy as f64 * scale;
     let dx1 = dx0 + sw as f64 * scale;
@@ -524,7 +604,7 @@ fn map_region_rgb565_to_fb(
     let mut ix1 = 0u32;
     let mut iy1 = 0u32;
     for (vx, vy) in corners {
-        let (wx, wy) = mirror_view_pixel_to_wire(vx, vy, orientation, fb_w, fb_h);
+        let (wx, wy) = mirror_view_pixel_to_wire(vx, vy, orientation, protocol_w, protocol_h);
         ix0 = ix0.min(wx);
         iy0 = iy0.min(wy);
         ix1 = ix1.max(wx);
@@ -543,7 +623,7 @@ fn map_region_rgb565_to_fb(
         let screen_y = iy0 + iy;
         for ix in 0..out_w {
             let screen_x = ix0 + ix;
-            let (vx, vy) = mirror_wire_pixel_to_view(screen_x, screen_y, orientation, fb_w, fb_h);
+            let (vx, vy) = mirror_wire_pixel_to_view(screen_x, screen_y, orientation, protocol_w, protocol_h);
             let u = (vx as f64 + 0.5 - off_x as f64) / scale - sx as f64;
             let v = (vy as f64 + 0.5 - off_y as f64) / scale - sy as f64;
             let src_ix = u.floor().clamp(0.0, (sw - 1) as f64) as u32;
