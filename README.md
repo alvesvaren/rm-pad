@@ -7,6 +7,7 @@ Features:
 - Touch input (multi-touch gestures, tapping and moving)
 - Configurable palm rejection (disables touch input for a configurable grace period if any pen input is detected, default 500ms)
 - Screen orientation support (portrait, landscape-right, landscape-left, inverted)
+- Fit modes (`--fit`): how the pen area maps onto the selected screen(s) — `fill` (stretch, default), `contain` (keep aspect, letterboxed), or `cover` (keep aspect, edges cropped). A non-`fill` fit targets the screen(s) chosen with `--screen` (repeatable; `rm-pad screens` lists them). Baked into the virtual device's own coordinate space, so it applies uniformly across every program — including apps that ignore the compositor's tablet-to-output mapping (e.g. osu!lazer) and so can't be corrected by a system-level Hyprland config alone
 - Input grab (enabled by default): A small helper binary is uploaded to `/tmp` on the tablet and uses `EVIOCGRAB` to exclusively grab the input devices. The tablet UI (xochitl) keeps running but receives no pen/touch events. The grab is automatically released when rm-pad exits or the SSH connection drops — no reboot or manual cleanup needed. Use `--no-grab-input` to disable.
 - Works over both wifi and USB
 - Very low latency (as long as your connection to the tablet is fast)
@@ -124,6 +125,10 @@ You can also use environment variables:
 - **no_palm_rejection**: Disable palm rejection
 - **palm_grace_ms**: Palm rejection grace period in milliseconds (default: 500)
 - **orientation**: Screen orientation - `portrait`, `landscape-right` (default), `landscape-left`, or `inverted`
+- **screen**: Screen(s) the pen area is fitted into, by index or name (run `rm-pad screens` to list them). Accepts a list — e.g. `screen = ["HDMI-1", "DP-1"]`, or repeat `--screen` on the command line — and the fit target is the combined bounding box of those screens. Empty (the default) means the whole desktop. Required whenever `fit` is anything other than `fill`
+- **fit**: How the pen area maps onto the selected screen(s) - `fill` (stretch, ignoring aspect ratio; default), `contain` (preserve the tablet's aspect ratio, letterboxed so the pen can't reach two edges), or `cover` (preserve aspect ratio and cover the whole target, cropping the tablet's edges). A non-`fill` fit requires at least one `screen`
+
+> **Why not just configure this in the compositor?** A compositor-level tablet mapping (e.g. Hyprland's) is only honored by programs that respect it. Some applications — osu!lazer is a notable example — grab the tablet and do their own coordinate handling, so a system-level aspect-ratio correction never reaches them. rm-pad instead applies the fit as a warp on the virtual input device itself, before any program sees it, so the same aspect-ratio behavior holds consistently everywhere rather than only in well-behaved apps.
 
 All options can also be set via command-line flags. Run `rm-pad --help` for details.
 

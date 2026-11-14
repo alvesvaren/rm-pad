@@ -10,3 +10,7 @@ host = "10.11.99.1"
 # no_palm_rejection = false
 # palm_grace_ms = 500
 # orientation = "landscape-right"
+# fit = "fill"        # pen-to-screen mapping: "fill" (stretch, default),
+                      # "contain" (keep aspect, letterboxed), or "cover"
+                      # (keep aspect, edges cropped). Anything but "fill"
+                      # requires "aspect_ratio" or "resolution".

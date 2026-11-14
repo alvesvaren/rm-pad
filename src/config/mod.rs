@@ -6,6 +6,8 @@ pub use cli::{Cli, Command};
 use std::path::PathBuf;
 
 use crate::device::DeviceProfile;
+use crate::display::{AspectRatio, Resolution};
+use crate::fit::FitMode;
 use crate::orientation::Orientation;
 
 /// Authentication method for SSH connection.
@@ -29,6 +31,9 @@ pub struct Config {
     pub no_palm_rejection: bool,
     pub palm_grace_ms: u64,
     pub orientation: Orientation,
+    pub fit: FitMode,
+    pub aspect_ratio: Option<AspectRatio>,
+    pub resolution: Option<Resolution>,
 }
 
 impl Config {
@@ -66,6 +71,17 @@ impl Config {
                 .or(file_config.palm_grace_ms)
                 .unwrap_or(500),
             orientation: cli.orientation.unwrap_or(file_config.orientation),
+            fit: cli.fit.unwrap_or(file_config.fit),
+            aspect_ratio: if let Some(ratio) = cli.aspect_ratio {
+                Some(ratio)
+            } else {
+                file_config.aspect_ratio
+            },
+            resolution: if let Some(res) = cli.resolution {
+                Some(res)
+            } else {
+                file_config.resolution
+            },
         }
     }
 
@@ -91,6 +107,16 @@ impl Config {
         }
         if !self.run_pen() && !self.run_touch() {
             return Err("No input device enabled");
+        }
+        // Aspect ratio and resolution describe the same target two ways; clap
+        // rejects both on the CLI, but the file config can still set both.
+        if self.aspect_ratio.is_some() && self.resolution.is_some() {
+            return Err("Cannot set both aspect_ratio and resolution");
+        }
+        // Fit warps the pen into a given bounding box, so a
+        // non-fill fit needs --aspect-ratio or --resolution
+        if self.fit != FitMode::Fill && self.aspect_ratio.is_none() && self.resolution.is_none() {
+            return Err("--fit (other than fill) requires either --aspect-ratio or --resolution");
         }
         Ok(())
     }

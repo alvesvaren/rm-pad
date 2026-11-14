@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::display::{AspectRatio, Resolution};
+use crate::fit::FitMode;
 use crate::orientation::Orientation;
 
 #[derive(Parser)]
@@ -58,6 +60,21 @@ pub struct Cli {
     /// Screen orientation (portrait, landscape-right, landscape-left, inverted)
     #[arg(long, value_parser = clap::value_parser!(Orientation))]
     pub orientation: Option<Orientation>,
+    /// How the pen area fits the target: fill/stretch (default),
+    /// contain/fit (letterbox, keep aspect), or cover (crop, keep aspect).
+    /// Anything other than fill/stretch requires --aspect-ratio or --resolution.
+    #[arg(long, value_parser = clap::value_parser!(FitMode))]
+    pub fit: Option<FitMode>,
+
+    /// Target aspect ratio the pen area is fitted into, as WIDTH:HEIGHT (e.g.
+    /// 16:9). Mutually exclusive with --resolution.
+    #[arg(long, value_parser = clap::value_parser!(AspectRatio), conflicts_with = "resolution")]
+    pub aspect_ratio: Option<AspectRatio>,
+
+    /// Target resolution the pen area is fitted into, as WIDTHxHEIGHT (e.g.
+    /// 1920x1080). Mutually exclusive with --aspect-ratio.
+    #[arg(long, value_parser = clap::value_parser!(Resolution))]
+    pub resolution: Option<Resolution>,
 
     /// Path to config file
     #[arg(long, env = "RMPAD_CONFIG")]

@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::display::{AspectRatio, Resolution};
+use crate::fit::FitMode;
 use crate::orientation::Orientation;
 
 const DEFAULT_HOST: &str = "10.11.99.1";
@@ -25,6 +27,12 @@ pub struct FileConfig {
     pub palm_grace_ms: Option<u64>,
     #[serde(default)]
     pub orientation: Orientation,
+    #[serde(default)]
+    pub fit: FitMode,
+    #[serde(default)]
+    pub aspect_ratio: Option<AspectRatio>,
+    #[serde(default)]
+    pub resolution: Option<Resolution>,
 }
 
 impl Default for FileConfig {
@@ -41,6 +49,9 @@ impl Default for FileConfig {
             no_palm_rejection: false,
             palm_grace_ms: None,
             orientation: Orientation::default(),
+            fit: FitMode::default(),
+            aspect_ratio: None,
+            resolution: None,
         }
     }
 }

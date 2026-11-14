@@ -1,10 +1,13 @@
 mod config;
 mod device;
+mod display;
 mod dump;
+mod fit;
 mod grab;
 mod input;
 mod orientation;
 mod palm;
+mod pen_map;
 mod ssh;
 
 use std::sync::atomic::Ordering;
@@ -24,7 +27,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     
     init_logging(cli.command.is_some());
-    
+
     // Detect device via SSH (required)
     let config_for_detection = Config::load(&cli, DeviceProfile::current());
     let session = ssh::connect_for_detection(&config_for_detection)?;
@@ -77,13 +80,16 @@ fn log_startup_info(config: &Config) {
     };
 
     log::info!(
-        "Starting rm-pad: host={}, pen={}, touch={}, palm_rejection={}, grab_input={}, orientation={}",
+        "Starting rm-pad: host={}, pen={}, touch={}, palm_rejection={}, grab_input={}, orientation={}, fit={}, aspect_ratio={}, resolution={}",
         config.host,
         if config.run_pen() { &config.pen_device } else { "off" },
         if config.run_touch() { &config.touch_device } else { "off" },
         palm_info,
         config.grab_input,
-        config.orientation
+        config.orientation,
+        config.fit,
+        config.aspect_ratio.as_ref().map_or(String::from("None"), |a| a.to_string()),
+        config.resolution.as_ref().map_or(String::from("None"), |r| r.to_string()),
     );
 }
 
