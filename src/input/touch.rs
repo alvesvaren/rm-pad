@@ -91,7 +91,11 @@ impl FrameState {
     }
 }
 
-fn create_touchpad_device(device: &DeviceProfile, orientation: Orientation) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
+fn create_touch_uinput_device(
+    device: &DeviceProfile,
+    orientation: Orientation,
+    touchscreen: bool,
+) -> Result<UinputDevice, Box<dyn std::error::Error + Send + Sync>> {
     let (out_x_max, out_y_max) = orientation.touch_output_dimensions(device.touch_x_max, device.touch_y_max);
     let resolution = device.touch_resolution;
 
@@ -104,20 +108,34 @@ fn create_touchpad_device(device: &DeviceProfile, orientation: Orientation) -> R
         AbsSetup::new(Abs::MT_POSITION_Y, AbsInfo::new(0, out_y_max).with_resolution(resolution)),
     ];
 
-    let device = UinputDevice::builder()?
-        .with_props([InputProp::POINTER, InputProp::BUTTONPAD])?
-        .with_abs_axes(axes)?
-        .with_keys([
-            Key::BTN_LEFT,
-            Key::BTN_TOUCH,
-            Key::BTN_TOOL_FINGER,
-            Key::BTN_TOOL_DOUBLETAP,
-            Key::BTN_TOOL_TRIPLETAP,
-            Key::BTN_TOOL_QUADTAP,
-        ])?
-        .build("reMarkable Touch")?;
+    let builder = UinputDevice::builder()?;
+    let builder = if touchscreen {
+        // Direct-mapping surface: libinput/KDE classify as touchscreen, not touchpad.
+        builder.with_props([InputProp::DIRECT])?
+    } else {
+        builder.with_props([InputProp::POINTER, InputProp::BUTTONPAD])?
+    };
 
-    Ok(device)
+    let uinput = if touchscreen {
+        builder
+            .with_abs_axes(axes)?
+            .with_keys([Key::BTN_TOUCH])?
+            .build("reMarkable Touchscreen")?
+    } else {
+        builder
+            .with_abs_axes(axes)?
+            .with_keys([
+                Key::BTN_LEFT,
+                Key::BTN_TOUCH,
+                Key::BTN_TOOL_FINGER,
+                Key::BTN_TOOL_DOUBLETAP,
+                Key::BTN_TOOL_TRIPLETAP,
+                Key::BTN_TOOL_QUADTAP,
+            ])?
+            .build("reMarkable Touch")?
+    };
+
+    Ok(uinput)
 }
 
 pub fn run_touch(
@@ -128,8 +146,11 @@ pub fn run_touch(
     let (_cleanup, mut channel) =
         ssh::open_input_stream(&config.touch_device, config, config.grab_input)?;
 
-    log::info!("Creating touch uinput device");
-    let uinput = create_touchpad_device(device_profile, config.orientation)?;
+    log::info!(
+        "Creating touch uinput device ({})",
+        if config.touchscreen { "touchscreen" } else { "touchpad" }
+    );
+    let uinput = create_touch_uinput_device(device_profile, config.orientation, config.touchscreen)?;
 
     if let Ok(name) = uinput.sysname() {
         log::info!("Touch device ready: /sys/devices/virtual/input/{}", name.to_string_lossy());
@@ -138,7 +159,15 @@ pub fn run_touch(
     std::thread::sleep(Duration::from_secs(1));
     log::info!("Touch forwarding started");
 
-    run_event_loop(&mut channel, &uinput, device_profile, config.orientation, palm, config.palm_grace_ms)
+    run_event_loop(
+        &mut channel,
+        &uinput,
+        device_profile,
+        config.orientation,
+        palm,
+        config.palm_grace_ms,
+        config.touchscreen,
+    )
 }
 
 fn run_event_loop(
@@ -148,6 +177,7 @@ fn run_event_loop(
     orientation: Orientation,
     palm: Option<SharedPalmState>,
     grace_ms: u64,
+    touchscreen: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; device.input_event_size];
     let mut slots = SlotState::new();
@@ -184,12 +214,19 @@ fn run_event_loop(
         let contact_count = slots.active_count();
 
         if should_suppress_palm(&palm, grace_ms) {
-            emit_palm_suppression(uinput, &mut slots)?;
+            emit_palm_suppression(uinput, &mut slots, touchscreen)?;
             log_frame_progress(&mut frame_count, 0, true);
             continue;
         }
 
-        emit_touch_frame(uinput, &mut slots, &mut next_tracking_id, device, orientation)?;
+        emit_touch_frame(
+            uinput,
+            &mut slots,
+            &mut next_tracking_id,
+            device,
+            orientation,
+            touchscreen,
+        )?;
         log_frame_progress(&mut frame_count, contact_count, false);
     }
 }
@@ -279,6 +316,7 @@ fn should_suppress_palm(palm: &Option<SharedPalmState>, grace_ms: u64) -> bool {
 fn emit_palm_suppression(
     uinput: &UinputDevice,
     slots: &mut SlotState,
+    touchscreen: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = uinput.writer();
 
@@ -294,7 +332,7 @@ fn emit_palm_suppression(
         slots.tracking_id[slot] = None;
     }
 
-    let key_events = release_all_tool_keys();
+    let key_events = release_all_tool_keys(touchscreen);
     writer = writer.write(&key_events)?;
     writer.finish()?;
 
@@ -307,6 +345,7 @@ fn emit_touch_frame(
     next_tracking_id: &mut i32,
     device: &DeviceProfile,
     orientation: Orientation,
+    touchscreen: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = uinput.writer();
     let contact_count = slots.active_count();
@@ -369,15 +408,23 @@ fn emit_touch_frame(
         ])?;
     }
 
-    let key_events = build_tool_key_events(contact_count);
+    let key_events = build_tool_key_events(contact_count, touchscreen);
     writer = writer.write(&key_events)?;
     writer.finish()?;
 
     Ok(())
 }
 
-fn build_tool_key_events(contact_count: i32) -> Vec<evdevil::event::InputEvent> {
+fn build_tool_key_events(contact_count: i32, touchscreen: bool) -> Vec<evdevil::event::InputEvent> {
     let finger_down = contact_count > 0;
+
+    if touchscreen {
+        return vec![KeyEvent::new(
+            Key::BTN_TOUCH,
+            if finger_down { KeyState::PRESSED } else { KeyState::RELEASED },
+        )
+        .into()];
+    }
 
     let tool_key = match contact_count {
         0 => None,
@@ -410,7 +457,11 @@ fn build_tool_key_events(contact_count: i32) -> Vec<evdevil::event::InputEvent> 
     events
 }
 
-fn release_all_tool_keys() -> Vec<evdevil::event::InputEvent> {
+fn release_all_tool_keys(touchscreen: bool) -> Vec<evdevil::event::InputEvent> {
+    if touchscreen {
+        return vec![KeyEvent::new(Key::BTN_TOUCH, KeyState::RELEASED).into()];
+    }
+
     [
         Key::BTN_TOUCH,
         Key::BTN_TOOL_FINGER,

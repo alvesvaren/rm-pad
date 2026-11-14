@@ -18,6 +18,9 @@ pub struct FileConfig {
     pub touch_only: bool,
     #[serde(default)]
     pub pen_only: bool,
+    /// Virtual touch device uses INPUT_PROP_DIRECT (touchscreen) instead of touchpad props
+    #[serde(default)]
+    pub touchscreen: bool,
     #[serde(default = "default_true")]
     pub grab_input: bool,
     #[serde(default)]
@@ -38,6 +41,7 @@ impl Default for FileConfig {
             touch_device: None,
             touch_only: false,
             pen_only: false,
+            touchscreen: false,
             no_palm_rejection: false,
             palm_grace_ms: None,
             orientation: Orientation::default(),

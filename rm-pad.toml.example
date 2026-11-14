@@ -6,6 +6,7 @@ host = "10.11.99.1"
 
 # touch_only = false
 # pen_only = false
+# touchscreen = false   # INPUT_PROP_DIRECT so the host sees a touchscreen, not a touchpad
 # grab_input = true   # on by default; set false to let tablet UI also see input
 # no_palm_rejection = false
 # palm_grace_ms = 500
