@@ -29,6 +29,19 @@ makepkg -si
 
 The package includes a udev rule for uinput access and a systemd user service. After installation, follow the setup instructions below.
 
+### Nix
+
+A flake is provided with a dev shell and a build-from-source package:
+
+```bash
+# Development shell (Rust toolchain + ARM cross-compilers + native deps).
+# Or run `direnv allow` to load it automatically via the bundled .envrc.
+nix develop
+
+# Build/run from source:
+nix run .#rm-pad -- --help
+```
+
 ### Building from source
 
 You'll need Rust and C cross-compilers for ARM:
