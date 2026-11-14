@@ -1,0 +1,73 @@
+name: Update bin lock
+
+# Polls the upstream repo's latest release once a day and pins the x86_64
+# tarball URL + hash into bin-lock.json, so `nix run .../tag-bin` stays pure.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-bin-lock
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: alvesvaren/rm-pad
+  ASSET: rm-pad-linux-x86_64.tar.gz
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure tag-bin branch exists
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin tag-bin >/dev/null 2>&1; then
+            git fetch origin tag-bin
+            git checkout tag-bin
+          else
+            echo "tag-bin branch not found, creating it"
+            git checkout -b tag-bin
+            git push -u origin tag-bin
+          fi
+
+      - name: Resolve latest release artefact
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          url="https://github.com/$UPSTREAM/releases/download/$tag/$ASSET"
+
+          # Prefer the published checksum; fall back to hashing the tarball.
+          if sha256=$(curl -fsSL "$url.sha256" | awk '{print $1}') && [ -n "$sha256" ]; then
+            echo "using published $ASSET.sha256"
+          else
+            echo "no published checksum, hashing the tarball"
+            sha256=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+          fi
+
+          # Fail explicitly if the tag ships no x86_64 binary.
+          if ! curl -fsIL "$url" >/dev/null; then
+            echo "::error::release $tag has no $ASSET"
+            exit 1
+          fi
+
+          jq -n --arg tag "$tag" --arg url "$url" --arg sha256 "$sha256" \
+            '{tag: $tag, url: $url, sha256: $sha256}' > nix/bin-lock.json
+          cat nix/bin-lock.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/bin-lock.json || true
+          git commit -m "chore(tag-bin): lock $(jq -r .tag nix/bin-lock.json) release binary [skip ci]" || true
+          git push
