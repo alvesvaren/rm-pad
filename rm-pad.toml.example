@@ -10,3 +10,5 @@ host = "10.11.99.1"
 # no_palm_rejection = false
 # palm_grace_ms = 500
 # orientation = "landscape-right"
+# tilt_correction = "off"       # "off", "tilt", or "tilt-distance"
+# tilt_correction_gain = 1.0    # effective lever length in pen digitizer units (negative flips direction)

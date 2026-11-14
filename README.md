@@ -7,6 +7,7 @@ Features:
 - Touch input (multi-touch gestures, tapping and moving)
 - Configurable palm rejection (disables touch input for a configurable grace period if any pen input is detected, default 500ms)
 - Screen orientation support (portrait, landscape-right, landscape-left, inverted)
+- Optional tilt correction: cancels the small offset between the hover cursor and where the pen actually draws, caused by holding the pen at an angle
 - Input grab (enabled by default): A small helper binary is uploaded to `/tmp` on the tablet and uses `EVIOCGRAB` to exclusively grab the input devices. The tablet UI (xochitl) keeps running but receives no pen/touch events. The grab is automatically released when rm-pad exits or the SSH connection drops — no reboot or manual cleanup needed. Use `--no-grab-input` to disable.
 - Works over both wifi and USB
 - Very low latency (as long as your connection to the tablet is fast)
@@ -124,6 +125,8 @@ You can also use environment variables:
 - **no_palm_rejection**: Disable palm rejection
 - **palm_grace_ms**: Palm rejection grace period in milliseconds (default: 500)
 - **orientation**: Screen orientation - `portrait`, `landscape-right` (default), `landscape-left`, or `inverted`
+- **tilt_correction**: Cancel the tilt-induced hover-vs-contact pen offset - `off` (default), `tilt`, or `tilt-distance` (ramps the correction off as the pen lifts away)
+- **tilt_correction_gain**: Correction strength, i.e. the effective coil-to-nib lever length in pen digitizer units (default: `1.0`, off). Tune empirically; use a negative value to flip direction
 
 All options can also be set via command-line flags. Run `rm-pad --help` for details.
 

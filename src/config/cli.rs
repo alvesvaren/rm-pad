@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::orientation::Orientation;
+use crate::tilt::TiltCorrectionMode;
 
 #[derive(Parser)]
 #[command(name = "rm-pad")]
@@ -58,6 +59,14 @@ pub struct Cli {
     /// Screen orientation (portrait, landscape-right, landscape-left, inverted)
     #[arg(long, value_parser = clap::value_parser!(Orientation))]
     pub orientation: Option<Orientation>,
+
+    /// Pen tilt-offset correction (off, tilt, tilt-distance)
+    #[arg(long, value_parser = clap::value_parser!(TiltCorrectionMode))]
+    pub tilt_correction: Option<TiltCorrectionMode>,
+
+    /// Tilt-correction strength: effective lever length in pen digitizer units
+    #[arg(long)]
+    pub tilt_correction_gain: Option<f64>,
 
     /// Path to config file
     #[arg(long, env = "RMPAD_CONFIG")]

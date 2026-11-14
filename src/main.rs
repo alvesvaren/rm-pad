@@ -6,6 +6,7 @@ mod input;
 mod orientation;
 mod palm;
 mod ssh;
+mod tilt;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

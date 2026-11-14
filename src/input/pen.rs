@@ -10,6 +10,7 @@ use crate::device::DeviceProfile;
 use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
 use crate::ssh;
+use crate::tilt;
 
 use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT};
 
@@ -73,6 +74,17 @@ pub fn run_pen(
     let mut pending_tilt_y: Option<i32> = None;
     let orientation = config.orientation;
 
+    // Tilt-offset correction. `None` when disabled: the position path is then a
+    // plain pass-through, identical to the uncorrected behaviour.
+    let correction = tilt::resolve(config.tilt_correction, config.tilt_correction_gain);
+    if let Some(c) = &correction {
+        log::info!("Pen tilt correction: {} (gain {})", c.mode, c.gain);
+    }
+    // Last-known tilt/distance, since they are not reported on every frame.
+    let mut last_tilt_x = 0;
+    let mut last_tilt_y = 0;
+    let mut last_distance = 0;
+
     loop {
         channel.read_exact(&mut buf)?;
 
@@ -108,11 +120,18 @@ pub fn run_pen(
                 }
                 ABS_TILT_X => {
                     pending_tilt_x = Some(value);
+                    last_tilt_x = value;
                     continue;
                 }
                 ABS_TILT_Y => {
                     pending_tilt_y = Some(value);
+                    last_tilt_y = value;
                     continue;
+                }
+                // Hover distance is forwarded verbatim; we only record it to
+                // ramp the tilt correction, so it falls through to the batch.
+                ABS_DISTANCE => {
+                    last_distance = value;
                 }
                 _ => {}
             }
@@ -126,6 +145,25 @@ pub fn run_pen(
 
         // Transform and emit position events
         if let (Some(x), Some(y)) = (pending_x.take(), pending_y.take()) {
+            // Correct the tilt-induced coil-vs-nib offset in raw device space,
+            // before orientation (and any downstream aspect-ratio warp), where
+            // position and raw tilt share axes.
+            let (x, y) = match &correction {
+                Some(c) => {
+                    let (dx, dy) = c.offset(
+                        last_tilt_x,
+                        last_tilt_y,
+                        device_profile.pen_tilt_range,
+                        last_distance,
+                        device_profile.pen_distance_max,
+                    );
+                    (
+                        (x - dx).clamp(0, device_profile.pen_x_max),
+                        (y - dy).clamp(0, device_profile.pen_y_max),
+                    )
+                }
+                None => (x, y),
+            };
             let (out_x, out_y) = orientation.transform_pen(
                 x, y,
                 device_profile.pen_x_max,
