@@ -11,10 +11,11 @@ use crate::orientation::Orientation;
 use crate::palm::SharedPalmState;
 use crate::ssh;
 
-use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_SYN, SYN_REPORT};
+use super::event::{key_event, parse_input_event, ABS_PRESSURE, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT};
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
+const ABS_DISTANCE: u16 = 0x19;
 const ABS_TILT_X: u16 = 0x1a;
 const ABS_TILT_Y: u16 = 0x1b;
 
@@ -61,6 +62,8 @@ pub fn run_pen(
     let mut buf = vec![0u8; device_profile.input_event_size];
     let mut batch: Vec<InputEvent> = Vec::with_capacity(32);
     let mut touch_down = false;
+    // evdev only reports changed values, so pressure persists across frames
+    let mut pressure: i32 = 0;
     let mut frame_count: u64 = 0;
 
     // For collecting X/Y/tilt values within a frame
@@ -80,6 +83,17 @@ pub fn run_pen(
         let ty = ev.event_type().raw();
         let code = ev.raw_code();
         let value = ev.raw_value();
+
+        // BTN_TOUCH is derived from pressure below; drop the device's own
+        if ty == EV_KEY && code == btn_touch_code {
+            continue;
+        }
+
+        if ty == EV_ABS && code == ABS_DISTANCE && device_profile.pen_distance_inverted {
+            let distance = device_profile.pen_distance_max - value.clamp(0, device_profile.pen_distance_max);
+            batch.push(InputEvent::new(ev.event_type(), code, distance));
+            continue;
+        }
 
         // Collect position and tilt values, defer transformation until SYN_REPORT
         if ty == EV_ABS {
@@ -128,11 +142,12 @@ pub fn run_pen(
             batch.insert(1, InputEvent::new(evdevil::event::EventType::from_raw(EV_ABS), Abs::TILT_Y.raw(), out_ty));
         }
 
-        let pressure = batch
+        if let Some(p) = batch
             .iter()
             .rfind(|e| e.event_type().raw() == EV_ABS && e.raw_code() == ABS_PRESSURE)
-            .map(|e| e.raw_value())
-            .unwrap_or(0);
+        {
+            pressure = p.raw_value();
+        }
 
         let now_touching = pressure > 0;
         update_palm_state(&palm, now_touching);

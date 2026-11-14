@@ -17,6 +17,8 @@ pub const RMPP: DeviceProfile = DeviceProfile {
     pen_y_max: 15340,
     pen_pressure_max: 4096,
     pen_distance_max: 65535,
+    // Elan digitizer reports ~0 on proximity-in, rising to ~19000 near contact
+    pen_distance_inverted: true,
     pen_tilt_range: 9000,
 
     touch_x_max: 2064,

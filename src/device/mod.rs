@@ -20,6 +20,8 @@ pub struct DeviceProfile {
     pub pen_y_max: i32,
     pub pen_pressure_max: i32,
     pub pen_distance_max: i32,
+    // Whether ABS_DISTANCE grows as the pen approaches (opposite of the evdev convention)
+    pub pen_distance_inverted: bool,
     pub pen_tilt_range: i32,
 
     // Touch screen dimensions

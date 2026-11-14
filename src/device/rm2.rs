@@ -11,6 +11,7 @@ pub const RM2: DeviceProfile = DeviceProfile {
     pen_y_max: 15725,
     pen_pressure_max: 4095,
     pen_distance_max: 255,
+    pen_distance_inverted: false,
     pen_tilt_range: 6400,
 
     // Touch screen: 1872×1404 display, ~210×158 mm → ~9 units/mm
